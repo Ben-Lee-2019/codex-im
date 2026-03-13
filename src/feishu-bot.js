@@ -595,13 +595,36 @@ class FeishuBotRuntime {
   }
 
   async listCodexThreadsForWorkspace(workspaceRoot) {
-    const response = await this.codex.listThreads({
-      cursor: null,
-      limit: 100,
-      sortKey: "updated_at",
-    });
-    const threads = extractThreadsFromListResponse(response);
-    return threads.filter((thread) => pathMatchesWorkspaceRoot(thread.cwd, workspaceRoot));
+    const allThreads = [];
+    const seenThreadIds = new Set();
+    let cursor = null;
+
+    for (let page = 0; page < 10; page += 1) {
+      const response = await this.codex.listThreads({
+        cursor,
+        limit: 200,
+        sortKey: "updated_at",
+      });
+      const pageThreads = extractThreadsFromListResponse(response);
+      for (const thread of pageThreads) {
+        if (seenThreadIds.has(thread.id)) {
+          continue;
+        }
+        seenThreadIds.add(thread.id);
+        allThreads.push(thread);
+      }
+
+      const nextCursor = extractThreadListCursor(response);
+      if (!nextCursor || nextCursor === cursor) {
+        break;
+      }
+      cursor = nextCursor;
+      if (pageThreads.length === 0) {
+        break;
+      }
+    }
+
+    return allThreads.filter((thread) => pathMatchesWorkspaceRoot(thread.cwd, workspaceRoot));
   }
 
   describeWorkspaceStatus(threadId) {
@@ -2654,6 +2677,25 @@ function extractThreadsFromListResponse(response) {
   return [];
 }
 
+function extractThreadListCursor(response) {
+  const cursorCandidates = [
+    response?.result?.next_cursor,
+    response?.result?.nextCursor,
+    response?.result?.cursor,
+    response?.cursor,
+    response?.next_cursor,
+    response?.nextCursor,
+  ];
+
+  for (const candidate of cursorCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return "";
+}
+
 function extractThreadDisplayName(thread) {
   const candidates = [
     thread?.title,
@@ -3143,14 +3185,20 @@ function normalizeWorkspacePath(value) {
     return "";
   }
 
-  const withForwardSlashes = normalized.replace(/\\/g, "/");
-  if (/^[A-Za-z]:\/$/.test(withForwardSlashes)) {
-    return withForwardSlashes;
+  const fromFileUri = extractPathFromFileUri(normalized);
+  const rawPath = fromFileUri || normalized;
+  const withForwardSlashes = rawPath.replace(/\\/g, "/").replace(/^\/\/\?\//, "");
+  const normalizedDrivePrefix = /^\/[A-Za-z]:\//.test(withForwardSlashes)
+    ? withForwardSlashes.slice(1)
+    : withForwardSlashes;
+
+  if (/^[A-Za-z]:\/$/.test(normalizedDrivePrefix)) {
+    return normalizedDrivePrefix;
   }
-  if (/^[A-Za-z]:\//.test(withForwardSlashes)) {
-    return withForwardSlashes.replace(/\/+$/g, "");
+  if (/^[A-Za-z]:\//.test(normalizedDrivePrefix)) {
+    return normalizedDrivePrefix.replace(/\/+$/g, "");
   }
-  return withForwardSlashes.replace(/\/+$/g, "");
+  return normalizedDrivePrefix.replace(/\/+$/g, "");
 }
 
 function isAbsoluteWorkspacePath(workspaceRoot) {
@@ -3170,7 +3218,41 @@ function pathMatchesWorkspaceRoot(candidatePath, workspaceRoot) {
   if (!normalizedCandidate || !normalizedWorkspaceRoot) {
     return false;
   }
-  return normalizedCandidate === normalizedWorkspaceRoot;
+  const compareCandidate = shouldComparePathCaseInsensitive(normalizedCandidate)
+    ? normalizedCandidate.toLowerCase()
+    : normalizedCandidate;
+  const compareWorkspaceRoot = shouldComparePathCaseInsensitive(normalizedWorkspaceRoot)
+    ? normalizedWorkspaceRoot.toLowerCase()
+    : normalizedWorkspaceRoot;
+  return (
+    compareCandidate === compareWorkspaceRoot
+    || compareCandidate.startsWith(`${compareWorkspaceRoot}/`)
+  );
+}
+
+function shouldComparePathCaseInsensitive(pathValue) {
+  return isWindowsStylePath(pathValue);
+}
+
+function extractPathFromFileUri(value) {
+  const input = String(value || "").trim();
+  if (!/^file:\/\//i.test(input)) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(input);
+    if (parsed.protocol !== "file:") {
+      return "";
+    }
+    const pathname = decodeURIComponent(parsed.pathname || "");
+    const withHost = parsed.host && parsed.host !== "localhost"
+      ? `//${parsed.host}${pathname}`
+      : pathname;
+    return withHost;
+  } catch {
+    return "";
+  }
 }
 
 function extractTextFromContent(content) {

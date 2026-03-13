@@ -2,16 +2,6 @@ const { spawn } = require("child_process");
 const os = require("os");
 const WebSocket = require("ws");
 
-const THREAD_SOURCE_KINDS = [
-  "cli",
-  "vscode",
-  "appServer",
-  "subAgentReview",
-  "subAgentCompact",
-  "subAgentThreadSpawn",
-  "unknown",
-];
-
 class CodexRpcClient {
   constructor({ endpoint = "", env = process.env, codexCommand = "" }) {
     this.endpoint = endpoint;
@@ -177,13 +167,23 @@ class CodexRpcClient {
     });
   }
 
-  async listThreads({ cursor = null, limit = 100, sortKey = "updated_at" } = {}) {
-    return this.sendRequest("thread/list", {
-      cursor,
+  async listThreads({ cursor = null, limit = 100, sortKey = "updated_at", sourceKinds = null } = {}) {
+    const params = {
       limit,
       sortKey,
-      sourceKinds: THREAD_SOURCE_KINDS,
-    });
+    };
+
+    if (typeof cursor === "string" && cursor.trim()) {
+      params.cursor = cursor.trim();
+    } else if (cursor != null) {
+      params.cursor = cursor;
+    }
+
+    if (Array.isArray(sourceKinds) && sourceKinds.length > 0) {
+      params.sourceKinds = sourceKinds;
+    }
+
+    return this.sendRequest("thread/list", params);
   }
 
   async sendRequest(method, params) {
