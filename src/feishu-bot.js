@@ -73,13 +73,19 @@ class FeishuBotRuntime {
   }
 
   startLongConnection() {
-    const eventDispatcher = new this.lark.EventDispatcher({}, async (data) => {
-      return this.handleCardAction(data);
-    }).register({
+    const eventDispatcher = new this.lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (data) => {
         this.handleIncomingTextEvent(data).catch((error) => {
           console.error(`[codex-im] failed to process Feishu message: ${error.message}`);
         });
+      },
+      "card.action.trigger": async (data) => {
+        try {
+          return await this.handleCardAction(data);
+        } catch (error) {
+          console.error(`[codex-im] failed to process card action: ${error.message}`);
+          return buildCardToast(`处理失败: ${error.message}`);
+        }
       },
     });
 
@@ -879,9 +885,16 @@ class FeishuBotRuntime {
   }
 
   async handleCardAction(data) {
+    try {
+      console.log("[codex-im] card callback raw:", JSON.stringify(data));
+    } catch {
+      console.log("[codex-im] card callback raw: <unserializable>");
+    }
+
     const action = extractCardAction(data);
+    console.log("[codex-im] card callback parsed action:", action);
     if (!action) {
-      return {};
+      return buildCardToast("无法识别卡片操作。");
     }
 
     if (action.kind === "approval") {
@@ -892,13 +905,18 @@ class FeishuBotRuntime {
 
       const chatId = approval.chatId || extractCardChatId(data);
       try {
+        const resolution = action.decision === "approve" ? "approved" : "rejected";
+        const resolvedApproval = {
+          ...approval,
+          resolution,
+        };
         const decision = resolveApprovalDecision(
           action.decision,
           approval.method,
           action.scope === "session" ? "/codex approve session" : "/codex approve"
         );
         await this.codex.sendResponse(approval.requestId, decision);
-        await this.markApprovalResolved(action.threadId, action.decision === "approve" ? "approved" : "rejected");
+        await this.markApprovalResolved(action.threadId, resolution);
         if (chatId) {
           await this.sendTextMessage({
             chatId,
@@ -906,7 +924,10 @@ class FeishuBotRuntime {
             text: action.decision === "approve" ? "已批准本次请求。" : "已拒绝本次请求。",
           });
         }
-        return buildCardToast(action.decision === "approve" ? "已批准" : "已拒绝");
+        return buildCardResponse({
+          toast: action.decision === "approve" ? "已批准" : "已拒绝",
+          card: buildApprovalResolvedCard(resolvedApproval),
+        });
       } catch (error) {
         return buildCardToast(`处理失败: ${error.message}`);
       }
@@ -956,7 +977,7 @@ class FeishuBotRuntime {
       return buildCardToast(`处理失败: ${error.message}`);
     }
 
-    return {};
+    return buildCardToast("未支持的卡片操作。");
   }
 
   async markApprovalResolved(threadId, resolution) {
@@ -2327,6 +2348,10 @@ function extractCardAction(data) {
   const action = data?.action || {};
   const value = action.value || {};
   if (!value.kind) {
+    console.log("[codex-im] card callback action missing kind", {
+      action,
+      hasValue: !!action.value,
+    });
     return null;
   }
   if (value.kind === "approval") {
@@ -2355,9 +2380,22 @@ function extractCardAction(data) {
 }
 
 function normalizeCardActionContext(data, config) {
-  const openMessageId = data?.open_message_id || data?.openMessageId || data?.message_id || "card-action";
+  const openMessageId = data?.context?.open_message_id
+    || data?.context?.openMessageId
+    || data?.open_message_id
+    || data?.openMessageId
+    || data?.message_id
+    || "card-action";
   const chatId = extractCardChatId(data);
   if (!chatId) {
+    console.log("[codex-im] card callback missing chatId", {
+      context_open_message_id: data?.context?.open_message_id,
+      context_open_chat_id: data?.context?.open_chat_id,
+      open_message_id: data?.open_message_id,
+      open_chat_id: data?.open_chat_id,
+      message_id: data?.message_id,
+      chat_id: data?.chat_id,
+    });
     return null;
   }
   return {
@@ -2365,7 +2403,7 @@ function normalizeCardActionContext(data, config) {
     workspaceId: config.defaultWorkspaceId,
     chatId,
     threadKey: "",
-    senderId: data?.operator?.operator_id?.open_id || data?.user_id || "",
+    senderId: data?.operator?.open_id || data?.operator?.operator_id?.open_id || data?.user_id || "",
     messageId: openMessageId,
     text: "",
     command: "",
@@ -2413,16 +2451,33 @@ function formatRelativeTimestamp(value) {
 }
 
 function extractCardChatId(data) {
-  return data?.open_chat_id || data?.openChatId || data?.chat_id || "";
+  return data?.context?.open_chat_id
+    || data?.context?.openChatId
+    || data?.open_chat_id
+    || data?.openChatId
+    || data?.chat_id
+    || "";
 }
 
 function buildCardToast(text) {
-  return {
-    toast: {
+  return buildCardResponse({ toast: text });
+}
+
+function buildCardResponse({ toast, card }) {
+  const response = {};
+  if (toast) {
+    response.toast = {
       type: "info",
-      content: text,
-    },
-  };
+      content: toast,
+    };
+  }
+  if (card) {
+    response.card = {
+      type: "raw",
+      data: card,
+    };
+  }
+  return response;
 }
 
 function patchWsClientForCardCallbacks(wsClient) {

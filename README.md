@@ -144,6 +144,9 @@ npm login
 npm publish
 ```
 
+# 飞书配置
+card.action.trigger
+
 
 # 参考项目
 https://github.com/larksuite/openclaw-lark
