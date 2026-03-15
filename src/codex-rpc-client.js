@@ -11,16 +11,6 @@ const CODEX_CLIENT_INFO = {
   version: "0.1.0",
 };
 
-const THREAD_SOURCE_KINDS = [
-  "cli",
-  "vscode",
-  "appServer",
-  "subAgentReview",
-  "subAgentCompact",
-  "subAgentThreadSpawn",
-  "unknown",
-];
-
 class CodexRpcClient {
   constructor({ endpoint = "", env = process.env, codexCommand = "" }) {
     this.endpoint = endpoint;
@@ -168,12 +158,11 @@ class CodexRpcClient {
     return this.sendRequest("thread/resume", { threadId: normalizedThreadId });
   }
 
-  async listThreads({ cursor = null, limit = 100, sortKey = "updated_at", sourceKinds = THREAD_SOURCE_KINDS } = {}) {
+  async listThreads({ cursor = null, limit = 100, sortKey = "updated_at" } = {}) {
     return this.sendRequest("thread/list", buildListThreadsParams({
       cursor,
       limit,
       sortKey,
-      sourceKinds,
     }));
   }
 
@@ -215,8 +204,10 @@ class CodexRpcClient {
   handleIncoming(rawMessage) {
     const parsed = tryParseJson(rawMessage);
     if (!parsed) {
+      logCodexParseFailure(rawMessage);
       return;
     }
+    logCodexInboundMessage(parsed, this.pending);
 
     if (parsed && parsed.id != null && this.pending.has(String(parsed.id))) {
       const { resolve, reject } = this.pending.get(String(parsed.id));
@@ -245,6 +236,107 @@ function tryParseJson(rawMessage) {
   } catch {
     return null;
   }
+}
+
+function logCodexInboundMessage(message, pendingRequests = new Map()) {
+  const context = buildInboundLogContext(message, pendingRequests);
+  try {
+    console.log(
+      `[codex-im] codex<= [${context.scene}] id=${context.id} method=${context.method} `
+      + `thread=${context.threadId} turn=${context.turnId} ${JSON.stringify(message)}`
+    );
+  } catch {
+    console.log(
+      `[codex-im] codex<= [${context.scene}] id=${context.id} method=${context.method} `
+      + `thread=${context.threadId} turn=${context.turnId} <unserializable message>`
+    );
+  }
+}
+
+function logCodexParseFailure(rawMessage) {
+  const sample = String(rawMessage || "").slice(0, 300);
+  console.warn(`[codex-im] codex<= [parse_failed] raw=${JSON.stringify(sample)}`);
+}
+
+function buildInboundLogContext(message, pendingRequests) {
+  const id = normalizeLogField(message?.id);
+  const method = normalizeLogField(message?.method);
+  const hasResult = !!(message && typeof message === "object" && Object.prototype.hasOwnProperty.call(message, "result"));
+  const hasError = !!(message && typeof message === "object" && Object.prototype.hasOwnProperty.call(message, "error"));
+  const hasMethod = !!method;
+  const isPendingResponse = !!(id && pendingRequests?.has?.(id));
+
+  let scene = "unknown";
+  if (hasMethod && hasResult) {
+    scene = "request_with_result";
+  } else if (hasMethod && id) {
+    scene = "request_from_codex";
+  } else if (hasMethod) {
+    scene = "event";
+  } else if (id && (hasResult || hasError)) {
+    scene = isPendingResponse ? "response" : "response_unmatched";
+  } else if (id) {
+    scene = "id_only";
+  }
+
+  const threadId = extractRpcField(message, [
+    "params.threadId",
+    "params.thread_id",
+    "params.turn.threadId",
+    "params.turn.thread_id",
+    "result.threadId",
+    "result.thread.threadId",
+    "result.thread.id",
+  ]);
+  const turnId = extractRpcField(message, [
+    "params.turnId",
+    "params.turn_id",
+    "params.turn.id",
+    "result.turnId",
+    "result.turn.id",
+  ]);
+
+  return {
+    scene,
+    id: id || "-",
+    method: method || "-",
+    threadId: threadId || "-",
+    turnId: turnId || "-",
+  };
+}
+
+function extractRpcField(root, dottedPaths) {
+  if (!root || typeof root !== "object" || !Array.isArray(dottedPaths)) {
+    return "";
+  }
+
+  for (const dottedPath of dottedPaths) {
+    const segments = String(dottedPath || "").split(".").filter(Boolean);
+    let cursor = root;
+    let matched = true;
+    for (const segment of segments) {
+      if (!cursor || typeof cursor !== "object" || !(segment in cursor)) {
+        matched = false;
+        break;
+      }
+      cursor = cursor[segment];
+    }
+    if (!matched) {
+      continue;
+    }
+    const normalized = normalizeLogField(cursor);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
+function normalizeLogField(value) {
+  return typeof value === "string" && value.trim()
+    ? value.trim()
+    : (Number.isFinite(value) ? String(value) : "");
 }
 
 function resolveDefaultCodexCommand(env = process.env) {
@@ -295,7 +387,7 @@ function buildStartThreadParams(cwd) {
   return normalizedCwd ? { cwd: normalizedCwd } : {};
 }
 
-function buildListThreadsParams({ cursor, limit, sortKey, sourceKinds }) {
+function buildListThreadsParams({ cursor, limit, sortKey }) {
   const params = { limit, sortKey };
   const normalizedCursor = normalizeNonEmptyString(cursor);
 
@@ -303,10 +395,6 @@ function buildListThreadsParams({ cursor, limit, sortKey, sourceKinds }) {
     params.cursor = normalizedCursor;
   } else if (cursor != null) {
     params.cursor = cursor;
-  }
-
-  if (Array.isArray(sourceKinds) && sourceKinds.length > 0) {
-    params.sourceKinds = sourceKinds;
   }
 
   return params;

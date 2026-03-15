@@ -624,12 +624,12 @@ class FeishuBotRuntime {
   }
 
   async listCodexThreadsForWorkspace(workspaceRoot) {
-    const allThreads = await this.listCodexThreadsPaginated({ sourceKinds: null });
+    const allThreads = await this.listCodexThreadsPaginated();
     const sourceFiltered = allThreads.filter((thread) => isSupportedThreadSourceKind(thread?.sourceKind));
     return filterThreadsByWorkspaceRoot(sourceFiltered, workspaceRoot);
   }
 
-  async listCodexThreadsPaginated({ sourceKinds = undefined } = {}) {
+  async listCodexThreadsPaginated() {
     const allThreads = [];
     const seenThreadIds = new Set();
     let cursor = null;
@@ -639,7 +639,6 @@ class FeishuBotRuntime {
         cursor,
         limit: 200,
         sortKey: "updated_at",
-        sourceKinds,
       });
       const pageThreads = codexMessageUtils.extractThreadsFromListResponse(response);
       for (const thread of pageThreads) {
@@ -2427,12 +2426,7 @@ function resolveDeleteReactionMethod(client) {
 }
 
 function extractCardChatId(data) {
-  return data?.context?.open_chat_id
-    || data?.context?.openChatId
-    || data?.open_chat_id
-    || data?.openChatId
-    || data?.chat_id
-    || "";
+  return normalizeIdentifier(data?.context?.open_chat_id);
 }
 
 function patchWsClientForCardCallbacks(wsClient) {

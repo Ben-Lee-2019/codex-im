@@ -127,19 +127,6 @@ npm run feishu-bot
 - `src/session-store.js`: 会话绑定持久化
 - `src/config.js`: 环境变量配置
 
-## 发布
-
-发布到 npm 前，你还需要自己确认：
-
-- `package.json` 的 `license`
-- `package.json` 的 `repository`
-
-发布命令（暂未支持）：
-
-```sh
-npm login
-npm publish
-```
 
 # 飞书配置
 
