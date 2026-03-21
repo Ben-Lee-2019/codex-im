@@ -37,6 +37,13 @@ const THREAD_ACTION_CONFIG = Object.freeze({
   }),
 });
 
+const REPLY_ACTION_CONFIG = Object.freeze({
+  show_full: Object.freeze({
+    feedback: "",
+    emptyText: "当前还没有可查看的完整输出，请稍后再试。",
+  }),
+});
+
 const WORKSPACE_ACTION_CONFIG = Object.freeze({
   status: Object.freeze({
     feedback: "正在查看线程列表...",
@@ -52,6 +59,7 @@ const WORKSPACE_ACTION_CONFIG = Object.freeze({
 
 module.exports = {
   PANEL_ACTION_CONFIG,
+  REPLY_ACTION_CONFIG,
   THREAD_ACTION_CONFIG,
   WORKSPACE_ACTION_CONFIG,
 };

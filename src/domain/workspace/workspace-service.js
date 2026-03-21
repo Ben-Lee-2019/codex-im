@@ -1,5 +1,7 @@
 const fs = require("fs");
 const path = require("path");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
 const {
   isAbsoluteWorkspacePath,
   isWorkspaceAllowed,
@@ -9,9 +11,13 @@ const {
 const {
   extractBindPath,
   extractEffortValue,
+  extractLsValue,
+  extractMkdirValue,
   extractModelValue,
+  extractPwdValue,
   extractRemoveWorkspacePath,
   extractSendPath,
+  splitCommandLine,
 } = require("../../shared/command-parsing");
 const {
   extractModelCatalogFromListResponse,
@@ -23,6 +29,8 @@ const codexMessageUtils = require("../../infra/codex/message-utils");
 const { formatFailureText } = require("../../shared/error-text");
 
 const MAX_FEISHU_UPLOAD_FILE_BYTES = 30 * 1024 * 1024;
+const MAX_TERMINAL_OUTPUT_BYTES = 512 * 1024;
+const execFileAsync = promisify(execFile);
 
 async function resolveWorkspaceContext(
   runtime,
@@ -199,6 +207,135 @@ async function handleHelpCommand(runtime, normalized) {
     replyToMessageId: normalized.messageId,
     text: runtime.buildHelpCardText(),
   });
+}
+
+async function handlePwdCommand(runtime, normalized) {
+  const workspaceContext = await resolveWorkspaceContext(runtime, normalized, {
+    replyToMessageId: normalized.messageId,
+    missingWorkspaceText: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+  });
+  if (!workspaceContext) {
+    return;
+  }
+
+  if (extractPwdValue(normalized.text)) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "用法: `/pwd`",
+    });
+    return;
+  }
+
+  const { workspaceRoot } = workspaceContext;
+  await runtime.sendInfoCardMessage({
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    text: buildTerminalCommandText("pwd", workspaceRoot, workspaceRoot),
+  });
+}
+
+async function handleLsCommand(runtime, normalized) {
+  const workspaceContext = await resolveWorkspaceContext(runtime, normalized, {
+    replyToMessageId: normalized.messageId,
+    missingWorkspaceText: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+  });
+  if (!workspaceContext) {
+    return;
+  }
+
+  const { workspaceRoot } = workspaceContext;
+
+  let parsed;
+  try {
+    parsed = parseLsRequest(normalized.text, workspaceRoot);
+  } catch (error) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: formatFailureText("执行 /ls 失败", error),
+    });
+    return;
+  }
+
+  if (parsed.usageText) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: parsed.usageText,
+    });
+    return;
+  }
+
+  try {
+    const result = await runWorkspaceCommand("ls", parsed.commandArgs, {
+      workspaceRoot,
+    });
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: buildTerminalCommandText(parsed.displayCommand, workspaceRoot, result || ""),
+    });
+  } catch (error) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: formatFailureText("执行 /ls 失败", error),
+    });
+  }
+}
+
+async function handleMkdirCommand(runtime, normalized) {
+  const workspaceContext = await resolveWorkspaceContext(runtime, normalized, {
+    replyToMessageId: normalized.messageId,
+    missingWorkspaceText: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+  });
+  if (!workspaceContext) {
+    return;
+  }
+
+  const { workspaceRoot } = workspaceContext;
+
+  let parsed;
+  try {
+    parsed = parseMkdirRequest(normalized.text, workspaceRoot);
+  } catch (error) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: formatFailureText("执行 /mkdir 失败", error),
+    });
+    return;
+  }
+
+  if (parsed.usageText) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: parsed.usageText,
+    });
+    return;
+  }
+
+  try {
+    const lines = [];
+    for (const entry of parsed.targets) {
+      await fs.promises.mkdir(entry.resolvedPath, { recursive: parsed.recursive });
+      lines.push(entry.displayPath);
+    }
+    const output = lines.map((line) => `created ${line}`).join("\n");
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: buildTerminalCommandText(parsed.displayCommand, workspaceRoot, output),
+    });
+  } catch (error) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: formatFailureText("执行 /mkdir 失败", error),
+    });
+  }
 }
 
 async function handleUnknownCommand(runtime, normalized) {
@@ -593,8 +730,11 @@ module.exports = {
   handleBindCommand,
   handleEffortCommand,
   handleHelpCommand,
+  handleLsCommand,
   handleMessageCommand,
+  handleMkdirCommand,
   handleModelCommand,
+  handlePwdCommand,
   handleRemoveCommand,
   handleSendCommand,
   handleUnknownCommand,
@@ -607,6 +747,150 @@ module.exports = {
   switchWorkspaceByPath,
   validateDefaultCodexParamsConfig,
 };
+
+function buildTerminalCommandText(command, workspaceRoot, output) {
+  return [
+    `当前目录：\`${workspaceRoot}\``,
+    `命令：\`${command}\``,
+    "",
+    "```text",
+    normalizeTerminalOutput(output) || "(无输出)",
+    "```",
+  ].join("\n");
+}
+
+function normalizeTerminalOutput(value) {
+  const normalized = String(value || "").replace(/\r\n/g, "\n").trimEnd();
+  if (!normalized) {
+    return "";
+  }
+
+  const lines = normalized.split("\n");
+  const limitedLines = lines.slice(0, 200);
+  let output = limitedLines.join("\n");
+  if (lines.length > limitedLines.length) {
+    output += `\n... (${lines.length - limitedLines.length} more lines)`;
+  }
+  if (output.length > 12000) {
+    output = `${output.slice(0, 12000)}\n... (truncated)`;
+  }
+  return output;
+}
+
+async function runWorkspaceCommand(command, args, { workspaceRoot }) {
+  try {
+    const result = await execFileAsync(command, args, {
+      cwd: workspaceRoot,
+      maxBuffer: MAX_TERMINAL_OUTPUT_BYTES,
+    });
+    return `${result.stdout || ""}${result.stderr || ""}`;
+  } catch (error) {
+    const stdout = normalizeTerminalOutput(error?.stdout || "");
+    const stderr = normalizeTerminalOutput(error?.stderr || "");
+    throw new Error(stderr || stdout || error?.message || `${command} 执行失败`);
+  }
+}
+
+function parseLsRequest(text, workspaceRoot) {
+  const rawArgs = extractLsValue(text);
+  const tokens = splitCommandLine(rawArgs);
+  const optionTokens = [];
+  const pathTokens = [];
+
+  for (const token of tokens) {
+    if (token.startsWith("-")) {
+      if (!isSupportedLsOption(token)) {
+        return {
+          usageText: "用法: `/ls` 或 `/ls <path>`\n可选：支持 `-a`、`-A`、`-l`、`-h` 的组合参数，例如 `/ls -la`。",
+        };
+      }
+      optionTokens.push(token);
+      continue;
+    }
+    pathTokens.push(token);
+  }
+
+  const targets = pathTokens.map((token) => resolveWorkspaceCommandTarget(workspaceRoot, token));
+  return {
+    usageText: "",
+    commandArgs: [...optionTokens, ...targets.map((item) => item.resolvedPath)],
+    displayCommand: buildDisplayCommand("ls", rawArgs),
+  };
+}
+
+function parseMkdirRequest(text, workspaceRoot) {
+  const rawArgs = extractMkdirValue(text);
+  const tokens = splitCommandLine(rawArgs);
+  if (!tokens.length) {
+    return {
+      usageText: "用法: `/mkdir <dir_path>`\n可选：`/mkdir -p <dir_path>`",
+    };
+  }
+
+  let recursive = false;
+  const pathTokens = [];
+
+  for (const token of tokens) {
+    if (token.startsWith("-")) {
+      if (!isSupportedMkdirOption(token)) {
+        return {
+          usageText: "用法: `/mkdir <dir_path>`\n可选：`/mkdir -p <dir_path>`",
+        };
+      }
+      if (token.includes("p")) {
+        recursive = true;
+      }
+      continue;
+    }
+    pathTokens.push(token);
+  }
+
+  if (!pathTokens.length) {
+    return {
+      usageText: "用法: `/mkdir <dir_path>`\n可选：`/mkdir -p <dir_path>`",
+    };
+  }
+
+  return {
+    usageText: "",
+    recursive,
+    targets: pathTokens.map((token) => resolveWorkspaceCommandTarget(workspaceRoot, token)),
+    displayCommand: buildDisplayCommand("mkdir", rawArgs),
+  };
+}
+
+function buildDisplayCommand(command, rawArgs) {
+  const suffix = String(rawArgs || "").trim();
+  return suffix ? `${command} ${suffix}` : command;
+}
+
+function isSupportedLsOption(token) {
+  return /^-[aAlh]+$/.test(String(token || "").trim());
+}
+
+function isSupportedMkdirOption(token) {
+  return /^-[pv]+$/.test(String(token || "").trim());
+}
+
+function resolveWorkspaceCommandTarget(workspaceRoot, requestedPath) {
+  const normalizedInput = normalizeWorkspacePath(requestedPath);
+  if (!normalizedInput) {
+    throw new Error("路径不能为空。");
+  }
+
+  const resolvedPath = isAbsoluteWorkspacePath(normalizedInput)
+    ? path.resolve(normalizedInput)
+    : path.resolve(workspaceRoot, requestedPath);
+  const normalizedResolvedPath = normalizeWorkspacePath(resolvedPath);
+  if (!pathMatchesWorkspaceRoot(normalizedResolvedPath, workspaceRoot)) {
+    throw new Error("路径超出了当前项目根目录。");
+  }
+
+  return {
+    resolvedPath,
+    displayPath: normalizeWorkspacePath(path.relative(workspaceRoot, resolvedPath)) || ".",
+  };
+}
 
 function resolveWorkspaceSendTarget(workspaceRoot, requestedPath) {
   const normalizedInput = normalizeWorkspacePath(requestedPath);

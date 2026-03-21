@@ -16,3 +16,6 @@ dist/
 Thumbs.db
 /.idea/
 /sessions.json
+/.runtime/
+/logs/
+/codex-im.restart.log

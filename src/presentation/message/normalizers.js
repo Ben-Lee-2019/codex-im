@@ -7,7 +7,7 @@ function normalizeFeishuTextEvent(event, config) {
     return null;
   }
 
-  const text = parseFeishuMessageText(message.content);
+  const text = normalizeIncomingText(parseFeishuMessageText(message.content));
   if (!text) {
     return null;
   }
@@ -60,11 +60,31 @@ function extractCardAction(data) {
       threadId: value.threadId || "",
     };
   }
+  if (value.kind === "reply") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+    };
+  }
   if (value.kind === "workspace") {
     return {
       kind: value.kind,
       action: value.action || "",
       workspaceRoot: value.workspaceRoot || "",
+    };
+  }
+  if (value.kind === "gpu") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+      jobId: value.jobId || "",
+    };
+  }
+  if (value.kind === "subagent") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+      threadId: value.threadId || "",
     };
   }
   return null;
@@ -110,6 +130,10 @@ function parseFeishuMessageText(rawContent) {
   }
 }
 
+function normalizeIncomingText(text) {
+  return String(text || "").trim();
+}
+
 function parseCommand(text) {
   const normalized = text.trim().toLowerCase();
   const prefixes = ["/codex "];
@@ -153,6 +177,21 @@ function parseCommand(text) {
   }
   if (matchesPrefixCommand(normalized, "effort")) {
     return "effort";
+  }
+  if (normalized === "/pwd" || normalized.startsWith("/pwd ")) {
+    return "pwd";
+  }
+  if (normalized === "/ls" || normalized.startsWith("/ls ")) {
+    return "ls";
+  }
+  if (normalized === "/mkdir" || normalized.startsWith("/mkdir ")) {
+    return "mkdir";
+  }
+  if (normalized === "/gpu" || normalized.startsWith("/gpu ")) {
+    return "gpu";
+  }
+  if (normalized === "/sq" || normalized.startsWith("/sq ")) {
+    return "sq";
   }
   if (prefixes.some((prefix) => normalized.startsWith(prefix))) {
     return "unknown_command";
