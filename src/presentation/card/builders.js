@@ -102,7 +102,7 @@ function buildApprovalCard(approval) {
   };
 }
 
-function buildAssistantReplyCard({ text, state }) {
+function buildAssistantReplyCard({ text, state, detailAction = null }) {
   const normalizedState = state || "streaming";
   const stateLabel = normalizedState === "failed"
     ? " · 🔴 执行失败"
@@ -116,6 +116,32 @@ function buildAssistantReplyCard({ text, state }) {
       : normalizedState === "completed"
         ? "执行完成"
       : "思考中";
+  const actionElements = detailAction
+    ? [
+      { tag: "hr" },
+      {
+        tag: "column_set",
+        flex_mode: "stretch",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              {
+                tag: "button",
+                text: {
+                  tag: "plain_text",
+                  content: normalizedState === "streaming" ? "查看当前完整输出" : "查看完整输出",
+                },
+                value: detailAction,
+              },
+            ],
+          },
+        ],
+      },
+    ]
+    : [];
 
   return {
     schema: "2.0",
@@ -128,6 +154,46 @@ function buildAssistantReplyCard({ text, state }) {
         {
           tag: "markdown",
           content: `**🤖 Codex**${stateLabel}`,
+          text_size: "notation",
+        },
+        { tag: "hr" },
+        {
+          tag: "markdown",
+          content: sanitizeAssistantMarkdown(content),
+          text_size: "normal",
+        },
+        ...actionElements,
+      ],
+    },
+  };
+}
+
+function buildAssistantDetailCard({ text, state }) {
+  const normalizedState = state || "streaming";
+  const stateLabel = normalizedState === "failed"
+    ? " · 🔴 执行失败"
+    : normalizedState === "completed"
+      ? " · ✅ 已完成"
+      : " · 🟡 处理中";
+  const content = typeof text === "string" && text.trim()
+    ? text
+    : normalizedState === "failed"
+      ? "执行失败"
+      : normalizedState === "completed"
+        ? "执行完成"
+        : "思考中";
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: `**🤖 Codex 完整输出**${stateLabel}`,
           text_size: "notation",
         },
         { tag: "hr" },
@@ -442,11 +508,308 @@ function buildThreadPickerCard({ workspaceRoot, threads, currentThreadId }) {
   };
 }
 
+function buildGpuJobListCard({ jobs, userName = "", noticeText = "" }) {
+  const normalizedJobs = Array.isArray(jobs) ? jobs : [];
+  const elements = [
+    {
+      tag: "markdown",
+      content: `**运行中 GPU 作业**（${normalizedJobs.length}）`,
+      text_size: "normal",
+    },
+  ];
+
+  if (noticeText) {
+    elements.push({
+      tag: "markdown",
+      content: `✅ ${escapeCardMarkdown(noticeText)}`,
+      text_size: "notation",
+    });
+  }
+
+  if (userName) {
+    elements.push({
+      tag: "markdown",
+      content: `当前用户：\`${escapeCardMarkdown(userName)}\``,
+      text_size: "notation",
+    });
+  }
+
+  if (!normalizedJobs.length) {
+    elements.push(
+      { tag: "hr" },
+      {
+        tag: "markdown",
+        content: "暂无运行中的 GPU 作业。",
+        text_size: "normal",
+      }
+    );
+  } else {
+    elements.push({ tag: "hr" });
+    normalizedJobs.forEach((job, index) => {
+      if (index > 0) {
+        elements.push({ tag: "hr" });
+      }
+      elements.push(buildGpuJobRow(job));
+    });
+  }
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements,
+    },
+  };
+}
+
+function buildGpuJobRow(job) {
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 5,
+        vertical_align: "top",
+        elements: [
+          {
+            tag: "markdown",
+            content: [
+              `**${escapeCardMarkdown(job?.jobId || "-")}** · ${escapeCardMarkdown(job?.name || "未命名作业")}`,
+              `TIME：${escapeCardMarkdown(job?.time || "-")}`,
+              `NODELIST：${escapeCardMarkdown(job?.nodeList || "-")}`,
+            ].join("\n"),
+            text_size: "notation",
+          },
+        ],
+      },
+      {
+        tag: "column",
+        width: "auto",
+        vertical_align: "center",
+        elements: [
+          {
+            tag: "button",
+            text: { tag: "plain_text", content: "查看 GPU" },
+            type: "primary",
+            value: buildGpuActionValue("view_job", job?.jobId || ""),
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildGpuMonitorCard({
+  job,
+  gpuLines,
+  updatedAtText = "",
+  statusText = "",
+  state = "active",
+}) {
+  const isTerminal = state === "terminal";
+  const normalizedGpuLines = Array.isArray(gpuLines) ? gpuLines.filter(Boolean) : [];
+  const elements = [
+    {
+      tag: "markdown",
+      content: isTerminal ? "**GPU 监控 · 已结束**" : "**GPU 监控**",
+      text_size: "normal",
+    },
+    {
+      tag: "markdown",
+      content: [
+        `JOBID：\`${escapeCardMarkdown(job?.jobId || "-")}\``,
+        `NAME：${escapeCardMarkdown(job?.jobName || "未命名作业")}`,
+        job?.runTime ? `TIME：${escapeCardMarkdown(job.runTime)}` : "",
+        job?.nodeList ? `NODELIST：${escapeCardMarkdown(job.nodeList)}` : "",
+      ].filter(Boolean).join("\n"),
+      text_size: "notation",
+    },
+  ];
+
+  if (statusText) {
+    elements.push({
+      tag: "markdown",
+      content: escapeCardMarkdown(statusText),
+      text_size: "notation",
+    });
+  }
+
+  elements.push({ tag: "hr" });
+  elements.push({
+    tag: "markdown",
+    content: normalizedGpuLines.length
+      ? `\`\`\`text\n${normalizedGpuLines.join("\n")}\n\`\`\``
+      : "暂无 GPU 数据。",
+    text_size: "normal",
+  });
+
+  if (updatedAtText) {
+    elements.push({
+      tag: "markdown",
+      content: `刷新时间：${escapeCardMarkdown(updatedAtText)}`,
+      text_size: "notation",
+    });
+  }
+
+  const footerColumns = [];
+  if (!isTerminal) {
+    footerColumns.push(buildFooterButtonColumn({
+      text: "退出监控",
+      value: buildGpuActionValue("stop_monitor"),
+      type: "danger",
+    }));
+  }
+  footerColumns.push(buildFooterButtonColumn({
+    text: "返回作业列表",
+    value: buildGpuActionValue("back_to_job_list"),
+  }));
+
+  elements.push(
+    { tag: "hr" },
+    {
+      tag: "column_set",
+      flex_mode: "none",
+      columns: footerColumns,
+    }
+  );
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements,
+    },
+  };
+}
+
+function buildSubagentStatusCard({ thread, state = "created", summary = "" }) {
+  const normalizedState = String(state || "").trim().toLowerCase();
+  const title = normalizedState === "completed"
+    ? `**子代理已完成 · ${formatSubagentIdentity(thread)}**`
+    : normalizedState === "running"
+      ? `**子代理运行中 · ${formatSubagentIdentity(thread)}**`
+      : normalizedState === "errored"
+        ? `**子代理执行失败 · ${formatSubagentIdentity(thread)}**`
+        : normalizedState === "shutdown"
+          ? `**子代理已关闭 · ${formatSubagentIdentity(thread)}**`
+          : `**已创建子代理 · ${formatSubagentIdentity(thread)}**`;
+  const elements = [
+    {
+      tag: "markdown",
+      content: title,
+      text_size: "normal",
+    },
+    {
+      tag: "markdown",
+      content: [
+        thread?.agentRole ? `角色：${escapeCardMarkdown(thread.agentRole)}` : "",
+        thread?.id ? `子代理ID：\`${escapeCardMarkdown(thread.id)}\`` : "",
+      ].filter(Boolean).join("\n"),
+      text_size: "notation",
+    },
+  ];
+
+  if (summary) {
+    elements.push(
+      { tag: "hr" },
+      {
+        tag: "markdown",
+        content: sanitizeAssistantMarkdown(summary),
+        text_size: "normal",
+      }
+    );
+  }
+
+  const footerColumns = [];
+  if (normalizedState === "completed" || normalizedState === "errored" || normalizedState === "shutdown") {
+    footerColumns.push(buildFooterButtonColumn({
+      text: "查看子代理详情",
+      value: buildSubagentActionValue("view_detail", thread?.id || ""),
+      type: "primary",
+    }));
+  }
+
+  if (footerColumns.length) {
+    elements.push(
+      { tag: "hr" },
+      {
+        tag: "column_set",
+        flex_mode: "none",
+        columns: footerColumns,
+      }
+    );
+  }
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements,
+    },
+  };
+}
+
+function buildSubagentTranscriptCard({ threadId, agentNickname = "", agentRole = "", state = "", messages }) {
+  const identity = formatSubagentIdentity({
+    agentNickname,
+    agentRole,
+  });
+  const stateLabel = buildSubagentDetailStateLabel(state);
+  const elements = [
+    {
+      tag: "markdown",
+      content: `**子代理对话详情 · ${identity}**${stateLabel}`,
+      text_size: "normal",
+    },
+    {
+      tag: "markdown",
+      content: [
+        agentRole ? `角色：${escapeCardMarkdown(agentRole)}` : "",
+        threadId ? `子代理ID：\`${escapeCardMarkdown(threadId)}\`` : "",
+      ].filter(Boolean).join("\n"),
+      text_size: "notation",
+    },
+    { tag: "hr" },
+    {
+      tag: "markdown",
+      content: buildTranscriptMarkdown(messages),
+      text_size: "normal",
+    },
+  ];
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements,
+    },
+  };
+}
+
 function buildHelpCardText() {
   const sections = [
     [
       "**直接对话**",
       "绑定项目后，直接发普通消息即可继续当前线程。",
+    ],
+    [
+      "**快捷终端命令**",
+      "`/pwd`\n`/ls`\n`/ls <path>`\n`/mkdir <dir_path>`",
+      "在当前绑定工作区内直接执行本地 `pwd`、`ls`、`mkdir`，不会走模型理解。",
     ],
     [
       "**绑定项目**",
@@ -457,6 +820,16 @@ function buildHelpCardText() {
       "**查看当前状态**",
       "`/codex where`",
       "查看当前绑定的项目和正在使用的线程。",
+    ],
+    [
+      "**查看运行中 GPU 作业**",
+      "`/gpu`",
+      "查看当前 Linux 用户运行中的 GPU 作业，并进入手机友好的 GPU 监控面板。",
+    ],
+    [
+      "**查看当前用户作业表**",
+      "`/sq`",
+      "查看当前 Linux 用户的紧凑版作业列表。",
     ],
     [
       "**查看最近消息**",
@@ -775,6 +1148,13 @@ function buildPanelActionValue(action) {
   };
 }
 
+function buildReplyActionValue(action) {
+  return {
+    kind: "reply",
+    action,
+  };
+}
+
 function buildFooterButtonColumn({ text, value, type = "" }) {
   const button = {
     tag: "button",
@@ -872,6 +1252,28 @@ function buildThreadActionValue(action, threadId) {
   };
 }
 
+function buildGpuActionValue(action, jobId = "") {
+  const value = {
+    kind: "gpu",
+    action,
+  };
+  if (jobId) {
+    value.jobId = jobId;
+  }
+  return value;
+}
+
+function buildSubagentActionValue(action, threadId = "") {
+  const value = {
+    kind: "subagent",
+    action,
+  };
+  if (threadId) {
+    value.threadId = threadId;
+  }
+  return value;
+}
+
 function buildWorkspaceActionValue(action, workspaceRoot) {
   return {
     kind: "workspace",
@@ -883,6 +1285,51 @@ function buildWorkspaceActionValue(action, workspaceRoot) {
 function summarizeThreadPreview(thread) {
   const updated = formatRelativeTimestamp(thread?.updatedAt);
   return updated ? `更新时间：${updated}` : "更新时间：未知";
+}
+
+function formatSubagentIdentity(thread) {
+  const nickname = normalizeIdentifier(thread?.agentNickname);
+  const role = normalizeIdentifier(thread?.agentRole);
+  if (nickname && role) {
+    return `${escapeCardMarkdown(nickname)}（${escapeCardMarkdown(role)}）`;
+  }
+  if (nickname) {
+    return escapeCardMarkdown(nickname);
+  }
+  if (role) {
+    return `Subagent（${escapeCardMarkdown(role)}）`;
+  }
+  return "Subagent";
+}
+
+function buildTranscriptMarkdown(messages) {
+  const normalizedMessages = Array.isArray(messages) ? messages : [];
+  if (!normalizedMessages.length) {
+    return "暂无可显示的子代理对话。";
+  }
+
+  return normalizedMessages.map((message) => {
+    const label = message?.role === "assistant" ? "🤖 **子代理**" : "🧭 **主代理**";
+    const text = sanitizeAssistantMarkdown(String(message?.text || "").trim() || "空");
+    return `${label}\n> ${text.replace(/\n/g, "\n> ")}`;
+  }).join("\n\n---\n\n");
+}
+
+function buildSubagentDetailStateLabel(state) {
+  const normalizedState = normalizeIdentifier(state).toLowerCase();
+  if (normalizedState === "completed") {
+    return " · ✅ 已完成";
+  }
+  if (normalizedState === "errored") {
+    return " · ❌ 执行失败";
+  }
+  if (normalizedState === "shutdown") {
+    return " · ⏹️ 已关闭";
+  }
+  if (normalizedState === "running") {
+    return " · ⏳ 处理中";
+  }
+  return "";
 }
 
 function formatRelativeTimestamp(value) {
@@ -1148,6 +1595,7 @@ function suggestModels(models, rawInput, limit = 3) {
 module.exports = {
   buildApprovalCard,
   buildApprovalResolvedCard,
+  buildAssistantDetailCard,
   buildAssistantReplyCard,
   buildCardResponse,
   buildCardToast,
@@ -1160,6 +1608,11 @@ module.exports = {
   buildEffortInfoText,
   buildEffortListText,
   buildEffortValidationErrorText,
+  buildGpuJobListCard,
+  buildReplyActionValue,
+  buildGpuMonitorCard,
+  buildSubagentStatusCard,
+  buildSubagentTranscriptCard,
   buildThreadMessagesSummary,
   buildThreadPickerCard,
   buildWorkspaceBindingsCard,

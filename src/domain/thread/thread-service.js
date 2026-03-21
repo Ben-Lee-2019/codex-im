@@ -115,6 +115,7 @@ async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, norma
   if (!resolvedThreadId) {
     throw new Error("thread/start did not return a thread id");
   }
+  const sessionPath = codexMessageUtils.extractThreadPath(response);
 
   runtime.sessionStore.setThreadIdForWorkspace(
     bindingKey,
@@ -126,6 +127,9 @@ async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, norma
   runtime.setPendingThreadContext(resolvedThreadId, normalized);
   runtime.setThreadBindingKey(resolvedThreadId, bindingKey);
   runtime.setThreadWorkspaceRoot(resolvedThreadId, workspaceRoot);
+  if (sessionPath) {
+    runtime.threadSessionPathByThreadId.set(resolvedThreadId, sessionPath);
+  }
   return resolvedThreadId;
 }
 
@@ -137,6 +141,10 @@ async function ensureThreadResumed(runtime, threadId) {
 
   const response = await runtime.codex.resumeThread({ threadId: normalizedThreadId });
   runtime.resumedThreadIds.add(normalizedThreadId);
+  const sessionPath = codexMessageUtils.extractThreadPath(response);
+  if (sessionPath) {
+    runtime.threadSessionPathByThreadId.set(normalizedThreadId, sessionPath);
+  }
   console.log(`[codex-im] thread/resume ok thread=${normalizedThreadId}`);
   return response;
 }

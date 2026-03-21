@@ -16,6 +16,7 @@ Codex 操作都留在 本地，飞书只负责消息交互。
 - 先加表情、后输出正文
 - 回复到触发它的原消息
 - `/codex bind` 绑定项目
+- `/pwd` / `/ls` / `/mkdir <dir_path>` 在当前绑定工作区内直接执行本地终端命令
 - `/codex where` 查看当前项目/线程
 - `/codex workspace` 查看当前会话已记录项目和线程
 - `/codex remove /绝对路径` 移除会话绑定项目
@@ -100,6 +101,10 @@ npm run feishu-bot
 常用命令：
 
 - `/codex bind /绝对路径`
+- `/pwd`
+- `/ls`
+- `/ls <path>`
+- `/mkdir <dir_path>`
 - `/codex where`
 - `/codex workspace`
 - `/codex remove /绝对路径`
@@ -115,6 +120,13 @@ npm run feishu-bot
 - `/codex approve session`
 - `/codex reject`
 - `/codex help`
+
+说明：
+
+- 这三个快捷命令不会走模型理解，而是在当前绑定项目的工作区内本地执行。
+- `/pwd` 返回当前绑定工作区路径。
+- `/ls` 和 `/ls <path>` 会列出当前工作区内的目录内容。
+- `/mkdir <dir_path>` 会在当前工作区内创建目录，支持 `/mkdir -p <dir_path>`。
 
 ## 项目与线程模型
 

@@ -1,9 +1,12 @@
 const { normalizeWorkspacePath } = require("../shared/workspace-paths");
 const {
   PANEL_ACTION_CONFIG,
+  REPLY_ACTION_CONFIG,
   THREAD_ACTION_CONFIG,
   WORKSPACE_ACTION_CONFIG,
 } = require("./card-action-config");
+const gpuRuntime = require("../domain/gpu/gpu-service");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 
 const TEXT_COMMAND_HANDLER_METHODS = {
   stop: "handleStopCommand",
@@ -19,14 +22,22 @@ const TEXT_COMMAND_HANDLER_METHODS = {
   new: "handleNewCommand",
   model: "handleModelCommand",
   effort: "handleEffortCommand",
+  pwd: "handlePwdCommand",
+  ls: "handleLsCommand",
+  mkdir: "handleMkdirCommand",
   approve: "handleApprovalCommand",
   reject: "handleApprovalCommand",
+  gpu: "handleGpuCommand",
+  sq: "handleSqCommand",
 };
 
 const CARD_ACTION_KIND_METHODS = {
   panel: "handlePanelCardAction",
+  reply: "handleReplyCardAction",
   thread: "handleThreadCardAction",
   workspace: "handleWorkspaceCardAction",
+  gpu: "handleGpuCardAction",
+  subagent: "handleSubagentCardAction",
 };
 
 const PANEL_CARD_ACTIONS = {
@@ -81,6 +92,13 @@ const THREAD_CARD_ACTIONS = {
   },
 };
 
+const REPLY_CARD_ACTIONS = {
+  show_full: {
+    feedback: REPLY_ACTION_CONFIG.show_full.feedback,
+    run: (runtime, normalized) => runtime.showAssistantReplyDetail(normalized),
+  },
+};
+
 const WORKSPACE_CARD_ACTIONS = {
   status: {
     feedback: WORKSPACE_ACTION_CONFIG.status.feedback,
@@ -132,6 +150,10 @@ function handlePanelCardAction(runtime, action, normalized) {
 
 function handleThreadCardAction(runtime, action, normalized) {
   return executeMappedCardAction(runtime, normalized, action, THREAD_CARD_ACTIONS);
+}
+
+function handleReplyCardAction(runtime, action, normalized) {
+  return executeMappedCardAction(runtime, normalized, action, REPLY_CARD_ACTIONS);
 }
 
 function handleWorkspaceCardAction(runtime, action, normalized) {
@@ -208,7 +230,10 @@ function buildPanelSelectAction({ command, feedback, missingValueText }) {
 module.exports = {
   dispatchTextCommand,
   dispatchCardAction,
+  handleGpuCardAction: gpuRuntime.handleGpuCardAction,
+  handleSubagentCardAction: subagentRuntime.handleSubagentCardAction,
   handlePanelCardAction,
+  handleReplyCardAction,
   handleThreadCardAction,
   handleWorkspaceCardAction,
 };

@@ -24,6 +24,10 @@ function extractThreadId(response) {
   return response?.result?.thread?.id || null;
 }
 
+function extractThreadPath(response) {
+  return normalizeIdentifier(response?.result?.thread?.path);
+}
+
 function mapCodexMessageToImEvent(message) {
   const method = message?.method;
   const params = message?.params || {};
@@ -31,8 +35,8 @@ function mapCodexMessageToImEvent(message) {
   const turnId = extractTurnIdentifier(params);
 
   if (isAssistantMessageMethod(method, params)) {
-    const text = extractAssistantText(params);
-    if (!text) {
+    const assistantText = extractAssistantText(method, params);
+    if (!assistantText.text) {
       return null;
     }
     return {
@@ -40,7 +44,9 @@ function mapCodexMessageToImEvent(message) {
       payload: {
         threadId,
         turnId,
-        text,
+        itemId: normalizeIdentifier(params?.itemId || params?.item?.id),
+        text: assistantText.text,
+        textMode: assistantText.mode,
       },
     };
   }
@@ -208,8 +214,14 @@ function extractThreadsFromListResponse(response) {
       id: normalizeIdentifier(thread?.id),
       cwd: normalizeWorkspacePath(thread?.cwd),
       title: normalizeIdentifier(thread?.name) || normalizeIdentifier(thread?.preview),
+      createdAt: Number(thread?.createdAt || 0),
       updatedAt: Number(thread?.updatedAt || 0),
       sourceKind: extractThreadSourceKind(thread),
+      parentThreadId: extractParentThreadId(thread),
+      statusType: normalizeIdentifier(thread?.status?.type).toLowerCase() || "unknown",
+      path: normalizeIdentifier(thread?.path),
+      agentNickname: normalizeIdentifier(thread?.agentNickname),
+      agentRole: normalizeIdentifier(thread?.agentRole),
     }))
     .filter((thread) => thread.id);
 }
@@ -219,12 +231,18 @@ function extractThreadListCursor(response) {
 }
 
 function extractRecentConversationFromResumeResponse(response, turnLimit = 3) {
+  return extractConversationFromResumeResponse(response, { turnLimit }).slice(-6);
+}
+
+function extractConversationFromResumeResponse(response, { turnLimit = Infinity } = {}) {
   const turns = response?.result?.thread?.turns;
   if (!Array.isArray(turns) || !turns.length) {
     return [];
   }
 
-  const recentTurns = turns.slice(-turnLimit);
+  const recentTurns = Number.isFinite(turnLimit)
+    ? turns.slice(-Math.max(1, turnLimit))
+    : turns;
   const messages = [];
 
   for (const turn of recentTurns) {
@@ -237,7 +255,7 @@ function extractRecentConversationFromResumeResponse(response, turnLimit = 3) {
     }
   }
 
-  return dedupeRecentConversationMessages(messages).slice(-6);
+  return dedupeRecentConversationMessages(messages);
 }
 
 function eventShouldClearPendingReaction(event) {
@@ -257,14 +275,15 @@ function eventShouldClearPendingReaction(event) {
   return false;
 }
 
-function extractAssistantText(params) {
+function extractAssistantText(method, params) {
+  const mode = method === "item/agentMessage/delta" ? "append" : "replace";
   const directText = [
     params?.delta,
     params?.item?.text,
   ];
   for (const value of directText) {
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
+    if (typeof value === "string" && value.length > 0) {
+      return { text: value, mode };
     }
   }
 
@@ -273,13 +292,13 @@ function extractAssistantText(params) {
     params?.content,
   ];
   for (const content of contentObjects) {
-    const extracted = extractTextFromContent(content);
+    const extracted = extractTextFromContentRaw(content);
     if (extracted) {
-      return extracted;
+      return { text: extracted, mode };
     }
   }
 
-  return "";
+  return { text: "", mode };
 }
 
 function extractTurnFailureText(params) {
@@ -499,7 +518,42 @@ function splitCommandLine(input) {
 
 
 function extractThreadSourceKind(thread) {
-  return normalizeIdentifier(thread?.source) || "unknown";
+  const source = thread?.source;
+  if (typeof source === "string" && source.trim()) {
+    return source.trim();
+  }
+  if (!source || typeof source !== "object") {
+    return "unknown";
+  }
+
+  const keys = Object.keys(source).filter(Boolean);
+  if (!keys.length) {
+    return "unknown";
+  }
+  return normalizeIdentifier(keys[0]) || "unknown";
+}
+
+function extractParentThreadId(thread) {
+  const direct = normalizeIdentifier(
+    thread?.source?.subAgent?.thread_spawn?.parent_thread_id
+    || thread?.source?.subagent?.thread_spawn?.parent_thread_id
+  );
+  if (direct) {
+    return direct;
+  }
+
+  const source = thread?.source;
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+
+  for (const nested of Object.values(source)) {
+    const candidate = normalizeIdentifier(nested?.thread_spawn?.parent_thread_id);
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return "";
 }
 
 function dedupeRecentConversationMessages(messages) {
@@ -583,13 +637,53 @@ function extractTextFromContent(content) {
   return "";
 }
 
+function extractTextFromContentRaw(content) {
+  if (typeof content === "string" && content.length > 0) {
+    return content;
+  }
+
+  if (!content) {
+    return "";
+  }
+
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const entry of content) {
+      if (typeof entry === "string" && entry.length > 0) {
+        parts.push(entry);
+        continue;
+      }
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const entryType = String(entry.type || "").toLowerCase();
+      if (entryType === "text" && typeof entry.text === "string" && entry.text.length > 0) {
+        parts.push(entry.text);
+      }
+    }
+    return parts.join("\n");
+  }
+
+  if (typeof content !== "object") {
+    return "";
+  }
+
+  if (typeof content.text === "string" && content.text.length > 0) {
+    return content.text;
+  }
+
+  return "";
+}
+
 module.exports = {
   buildApprovalResponsePayload,
   buildBindingMetadata,
   buildRunKey,
   eventShouldClearPendingReaction,
+  extractConversationFromResumeResponse,
   extractCreatedMessageId,
   extractThreadId,
+  extractThreadPath,
   extractThreadListCursor,
   extractThreadsFromListResponse,
   extractTurnIdFromRunKey,

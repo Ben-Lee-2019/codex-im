@@ -154,6 +154,7 @@ function cleanupThreadRuntimeState(runtime, threadId) {
   runtime.pendingChatContextByThreadId.delete(threadId);
   runtime.bindingKeyByThreadId.delete(threadId);
   runtime.workspaceRootByThreadId.delete(threadId);
+  runtime.threadSessionPathByThreadId.delete(threadId);
 
   for (const [runKey, entry] of runtime.replyCardByRunKey.entries()) {
     if (entry?.threadId === threadId) {

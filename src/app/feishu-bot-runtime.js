@@ -7,6 +7,10 @@ const {
   buildEffortInfoText,
   buildEffortListText,
   buildEffortValidationErrorText,
+  buildGpuJobListCard,
+  buildGpuMonitorCard,
+  buildSubagentStatusCard,
+  buildSubagentTranscriptCard,
   buildHelpCardText,
   buildModelInfoText,
   buildModelListText,
@@ -32,6 +36,7 @@ const {
   sendInfoCardMessage,
   sendInteractiveApprovalCard,
   sendInteractiveCard,
+  showAssistantReplyDetail,
   updateInteractiveCard,
   upsertAssistantReplyCard,
 } = require("../presentation/card/card-service");
@@ -41,6 +46,8 @@ const {
 } = require("../infra/feishu/client-adapter");
 const runtimeCommands = require("./command-dispatcher");
 const approvalRuntime = require("../domain/approval/approval-service");
+const gpuRuntime = require("../domain/gpu/gpu-service");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 const runtimeState = require("../domain/session/binding-context");
 const threadRuntime = require("../domain/thread/thread-service");
 const workspaceRuntime = require("../domain/workspace/workspace-service");
@@ -68,15 +75,24 @@ class FeishuBotRuntime {
     this.activeTurnIdByThreadId = new Map();
     this.pendingApprovalByThreadId = new Map();
     this.replyCardByRunKey = new Map();
+    this.replyDetailByMessageId = new Map();
     this.currentRunKeyByThreadId = new Map();
     this.replyFlushTimersByRunKey = new Map();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
+    this.threadSessionPathByThreadId = new Map();
     this.approvalAllowlistByWorkspaceRoot = new Map();
     this.inFlightApprovalRequestKeys = new Set();
     this.resumedThreadIds = new Set();
+    this.gpuMonitorByChatId = new Map();
+    this.gpuMonitorTimerByChatId = new Map();
+    this.subagentTrackerByRunKey = new Map();
+    this.subagentPollTimerByRunKey = new Map();
+    this.subagentCardByThreadId = new Map();
+    this.subagentMetadataByThreadId = new Map();
+    this.subagentSessionMetaByPath = new Map();
     this.codex.onMessage((message) => appDispatcher.onCodexMessage(this, message));
   }
 
@@ -221,6 +237,10 @@ function attachRuntimeForwarders() {
     buildEffortInfoText,
     buildEffortListText,
     buildEffortValidationErrorText,
+    buildGpuJobListCard,
+    buildGpuMonitorCard,
+    buildSubagentStatusCard,
+    buildSubagentTranscriptCard,
     buildHelpCardText,
     buildModelInfoText,
     buildModelListText,
@@ -271,6 +291,11 @@ function attachRuntimeForwarders() {
     handleSendCommand: workspaceRuntime.handleSendCommand,
     handleModelCommand: workspaceRuntime.handleModelCommand,
     handleEffortCommand: workspaceRuntime.handleEffortCommand,
+    handlePwdCommand: workspaceRuntime.handlePwdCommand,
+    handleLsCommand: workspaceRuntime.handleLsCommand,
+    handleMkdirCommand: workspaceRuntime.handleMkdirCommand,
+    handleGpuCommand: gpuRuntime.handleGpuCommand,
+    handleSqCommand: gpuRuntime.handleSqCommand,
     refreshWorkspaceThreads: threadRuntime.refreshWorkspaceThreads,
     describeWorkspaceStatus: threadRuntime.describeWorkspaceStatus,
     switchThreadById: threadRuntime.switchThreadById,
@@ -284,7 +309,10 @@ function attachRuntimeForwarders() {
     patchInteractiveCard,
     handleCardAction,
     dispatchCardAction: runtimeCommands.dispatchCardAction,
+    handleGpuCardAction: gpuRuntime.handleGpuCardAction,
+    handleSubagentCardAction: subagentRuntime.handleSubagentCardAction,
     handlePanelCardAction: runtimeCommands.handlePanelCardAction,
+    handleReplyCardAction: runtimeCommands.handleReplyCardAction,
     handleThreadCardAction: runtimeCommands.handleThreadCardAction,
     handleWorkspaceCardAction: runtimeCommands.handleWorkspaceCardAction,
     queueCardActionWithFeedback,
@@ -294,6 +322,7 @@ function attachRuntimeForwarders() {
     sendCardActionFeedback,
     switchWorkspaceByPath: workspaceRuntime.switchWorkspaceByPath,
     removeWorkspaceByPath: workspaceRuntime.removeWorkspaceByPath,
+    showAssistantReplyDetail,
     upsertAssistantReplyCard,
     addPendingReaction,
     movePendingReactionToThread,

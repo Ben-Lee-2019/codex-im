@@ -1,5 +1,6 @@
 const codexMessageUtils = require("../infra/codex/message-utils");
 const { formatFailureText } = require("../shared/error-text");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 
 async function handleStopCommand(runtime, normalized) {
   const bindingKey = runtime.sessionStore.buildBindingKey(normalized);
@@ -42,6 +43,7 @@ function handleCodexMessage(runtime, message) {
   codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
   codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
   codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
+  subagentRuntime.handleCodexLifecycleEvent(runtime, message);
   runtime.pruneRuntimeMapSizes();
   const outbound = codexMessageUtils.mapCodexMessageToImEvent(message);
   if (!outbound) {
@@ -85,8 +87,10 @@ async function deliverToFeishu(runtime, event) {
     await runtime.upsertAssistantReplyCard({
       threadId: event.payload.threadId,
       turnId: event.payload.turnId,
+      itemId: event.payload.itemId || "",
       chatId: event.payload.chatId,
       text: event.payload.text,
+      textMode: event.payload.textMode || "replace",
       state: "streaming",
       deferFlush: !runtime.config.feishuStreamingOutput,
     });
@@ -117,6 +121,7 @@ async function deliverToFeishu(runtime, event) {
         turnId: event.payload.turnId,
         chatId: event.payload.chatId,
         text: event.payload.text || "执行失败",
+        textMode: "append",
         state: "failed",
       });
     }
