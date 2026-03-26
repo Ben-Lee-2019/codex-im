@@ -1,4 +1,4 @@
-
+﻿
 const { sanitizeAssistantMarkdown } = require("../../shared/assistant-markdown");
 const { normalizeText, resolveEffectiveModelForEffort } = require("../../shared/model-catalog");
 
@@ -104,11 +104,6 @@ function buildApprovalCard(approval) {
 
 function buildAssistantReplyCard({ text, state, detailAction = null }) {
   const normalizedState = state || "streaming";
-  const stateLabel = normalizedState === "failed"
-    ? " · 🔴 执行失败"
-    : normalizedState === "completed"
-      ? ""
-      : " · 🟡 处理中";
   const content = typeof text === "string" && text.trim()
     ? text.trim()
     : normalizedState === "failed"
@@ -151,12 +146,6 @@ function buildAssistantReplyCard({ text, state, detailAction = null }) {
     },
     body: {
       elements: [
-        {
-          tag: "markdown",
-          content: `**🤖 Codex**${stateLabel}`,
-          text_size: "notation",
-        },
-        { tag: "hr" },
         {
           tag: "markdown",
           content: sanitizeAssistantMarkdown(content),
@@ -1173,13 +1162,27 @@ function mergeReplyText(previousText, nextText) {
   if (!nextText) {
     return previousText;
   }
+  if (previousText === nextText) {
+    return previousText;
+  }
   if (nextText.startsWith(previousText)) {
     return nextText;
+  }
+  if (previousText.endsWith(nextText)) {
+    return previousText;
   }
   if (previousText.startsWith(nextText)) {
     return previousText;
   }
-  return nextText;
+
+  const maxOverlap = Math.min(previousText.length, nextText.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (previousText.slice(-overlap) === nextText.slice(0, overlap)) {
+      return previousText + nextText.slice(overlap);
+    }
+  }
+
+  return previousText + nextText;
 }
 
 
