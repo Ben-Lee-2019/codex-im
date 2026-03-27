@@ -1,15 +1,21 @@
 const codexMessageUtils = require("../../infra/codex/message-utils");
+const { ASSISTANT_REPLY_MAX_BYTES } = require("../../shared/assistant-markdown");
 const messageNormalizers = require("../message/normalizers");
 const reactionRepo = require("../../infra/feishu/reaction-repo");
 const { formatFailureText } = require("../../shared/error-text");
 const {
   buildApprovalCard,
   buildApprovalResolvedCard,
+  buildAssistantDetailCard,
   buildAssistantReplyCard,
   buildCardResponse,
+  buildReplyActionValue,
   buildInfoCard,
-  mergeReplyText,
 } = require("./builders");
+
+const MAX_REPLY_DETAIL_ENTRIES = 1000;
+const MAX_REPLY_DETAIL_ITEMS = 100;
+const MAX_REPLY_DETAIL_SNAPSHOTS = 80;
 
 async function sendInfoCardMessage(runtime, { chatId, text, replyToMessageId = "", replyInThread = false, kind = "info" }) {
   if (!chatId || !text) {
@@ -145,7 +151,7 @@ async function sendCardActionFeedback(runtime, data, text, kind = "info") {
 
 async function upsertAssistantReplyCard(
   runtime,
-  { threadId, turnId, chatId, text, state, deferFlush = false }
+  { threadId, turnId, itemId = "", chatId, text, textMode = "replace", state, deferFlush = false }
 ) {
   if (!threadId || !chatId) {
     return;
@@ -180,14 +186,40 @@ async function upsertAssistantReplyCard(
       chatId,
       replyToMessageId: "",
       text: "",
+      fullText: "",
+      detailItems: [],
+      detailSnapshots: [],
       state: "streaming",
       threadId,
       turnId: resolvedTurnId,
+      itemId: "",
     };
   }
 
-  if (typeof text === "string" && text.length > 0) {
-    existing.text = mergeReplyText(existing.text, text);
+  const normalizedItemId = typeof itemId === "string" ? itemId.trim() : "";
+  if (normalizedItemId && existing.itemId && existing.itemId !== normalizedItemId) {
+    existing.text = "";
+    existing.fullText = "";
+  }
+  if (normalizedItemId) {
+    existing.itemId = normalizedItemId;
+  }
+
+  if (typeof text === "string" && text) {
+    const detailItem = upsertReplyDetailItem(existing, {
+      itemId: normalizedItemId,
+      text,
+      mode: textMode,
+    });
+    const previewText = typeof detailItem?.text === "string"
+      ? detailItem.text.trim()
+      : text.trim();
+    if (previewText) {
+      existing.text = previewText;
+    }
+    existing.fullText = typeof detailItem?.text === "string"
+      ? detailItem.text
+      : mergeReplyDetailText(existing.fullText, text, { mode: textMode });
   }
   existing.chatId = chatId;
   existing.replyToMessageId = runtime.pendingChatContextByThreadId.get(threadId)?.messageId || existing.replyToMessageId || "";
@@ -251,9 +283,17 @@ async function flushReplyCard(runtime, runKey) {
     return;
   }
 
+  if (shouldSuppressEmptyCompletedReplyCard(entry)) {
+    runtime.disposeReplyRunState(runKey, entry.threadId);
+    return;
+  }
+
+  captureReplySnapshot(entry);
+
   const card = buildAssistantReplyCard({
     text: entry.text,
     state: entry.state,
+    detailAction: buildReplyActionValue("show_full"),
   });
 
   if (!entry.messageId) {
@@ -267,6 +307,8 @@ async function flushReplyCard(runtime, runKey) {
       return;
     }
     runtime.setReplyCardEntry(runKey, entry);
+    rememberReplyDetail(runtime, entry.messageId, entry);
+    await syncOpenReplyDetailCard(runtime, entry.messageId);
     runtime.clearPendingReactionForThread(entry.threadId).catch((error) => {
       console.error(`[codex-im] failed to clear pending reaction after first reply card: ${error.message}`);
     });
@@ -280,10 +322,97 @@ async function flushReplyCard(runtime, runKey) {
     messageId: entry.messageId,
     card,
   });
+  rememberReplyDetail(runtime, entry.messageId, entry);
+  await syncOpenReplyDetailCard(runtime, entry.messageId);
 
   if (entry.state === "completed" || entry.state === "failed") {
     runtime.disposeReplyRunState(runKey, entry.threadId);
   }
+}
+
+function shouldSuppressEmptyCompletedReplyCard(entry) {
+  return entry?.state === "completed"
+    && !normalizeReplyMessageId(entry?.messageId)
+    && !hasReplyRenderableContent(entry);
+}
+
+function hasReplyRenderableContent(entry) {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+
+  if (normalizeReplyDetailSnapshots(entry.detailSnapshots).length) {
+    return true;
+  }
+  if (normalizeReplyDetailItems(entry.detailItems).length) {
+    return true;
+  }
+  if (typeof entry.fullText === "string" && entry.fullText.trim()) {
+    return true;
+  }
+  if (typeof entry.previewText === "string" && entry.previewText.trim()) {
+    return true;
+  }
+  return typeof entry.text === "string" && entry.text.trim().length > 0;
+}
+
+async function showAssistantReplyDetail(runtime, normalized) {
+  const messageId = normalizeReplyMessageId(normalized?.messageId);
+  const detail = messageId ? runtime.replyDetailByMessageId.get(messageId) || null : null;
+  if (!detail) {
+    await sendFeedbackByContext(runtime, normalized, {
+      text: "当前还没有可查看的完整输出，请稍后再试。",
+      kind: "error",
+    });
+    return;
+  }
+
+  const content = resolveReplyDetailContent(detail);
+  if (!content) {
+    await sendFeedbackByContext(runtime, normalized, {
+      text: "当前还没有可查看的完整输出，请稍后再试。",
+      kind: "error",
+    });
+    return;
+  }
+
+  if (Buffer.byteLength(content, "utf8") > ASSISTANT_REPLY_MAX_BYTES) {
+    await runtime.sendFileMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      replyInThread: true,
+      fileName: buildReplyDetailFileName(detail),
+      fileBuffer: Buffer.from(content, "utf8"),
+    });
+    return;
+  }
+
+  const card = buildAssistantDetailCard({
+    text: content,
+    state: detail.state,
+  });
+  if (detail.detailMessageId) {
+    await patchInteractiveCard(runtime, {
+      messageId: detail.detailMessageId,
+      card,
+    });
+    return;
+  }
+
+  const response = await sendInteractiveCard(runtime, {
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    replyInThread: true,
+    card,
+  });
+  const detailMessageId = codexMessageUtils.extractCreatedMessageId(response);
+  if (!detailMessageId) {
+    return;
+  }
+  runtime.replyDetailByMessageId.set(messageId, {
+    ...detail,
+    detailMessageId,
+  });
 }
 
 async function addPendingReaction(runtime, bindingKey, messageId) {
@@ -355,6 +484,311 @@ function disposeReplyRunState(runtime, runKey, threadId) {
   }
 }
 
+function mergeReplyDetailText(previousText, nextText, { mode = "replace" } = {}) {
+  const previous = typeof previousText === "string" ? previousText : "";
+  const next = typeof nextText === "string" ? nextText : "";
+  if (!next) {
+    return previous;
+  }
+  if (!previous) {
+    return next;
+  }
+  if (next === previous) {
+    return previous;
+  }
+  if (next.startsWith(previous) || next.includes(previous)) {
+    return next;
+  }
+  if (previous.startsWith(next) || previous.includes(next)) {
+    return previous;
+  }
+
+  const overlap = findTextOverlap(previous, next);
+  if (overlap > 0) {
+    return `${previous}${next.slice(overlap)}`;
+  }
+
+  if (mode === "append") {
+    return `${previous}${next}`;
+  }
+
+  return next.length >= previous.length ? next : previous;
+}
+
+function findTextOverlap(previous, next) {
+  const maxOverlap = Math.min(previous.length, next.length);
+  for (let length = maxOverlap; length > 0; length -= 1) {
+    if (previous.endsWith(next.slice(0, length))) {
+      return length;
+    }
+  }
+  return 0;
+}
+
+function rememberReplyDetail(runtime, messageId, entry) {
+  const normalizedMessageId = normalizeReplyMessageId(messageId);
+  if (!normalizedMessageId || !entry) {
+    return;
+  }
+  const previous = runtime.replyDetailByMessageId.get(normalizedMessageId) || null;
+
+  if (runtime.replyDetailByMessageId.has(normalizedMessageId)) {
+    runtime.replyDetailByMessageId.delete(normalizedMessageId);
+  }
+  runtime.replyDetailByMessageId.set(normalizedMessageId, {
+    fullText: resolveReplyDetailContent(entry),
+    previewText: typeof entry.text === "string" ? entry.text : "",
+    detailItems: cloneReplyDetailItems(entry.detailItems),
+    detailSnapshots: cloneReplyDetailSnapshots(entry.detailSnapshots),
+    state: entry.state || "streaming",
+    threadId: entry.threadId || "",
+    turnId: entry.turnId || "",
+    updatedAt: new Date().toISOString(),
+    detailMessageId: normalizeReplyMessageId(previous?.detailMessageId || ""),
+  });
+  while (runtime.replyDetailByMessageId.size > MAX_REPLY_DETAIL_ENTRIES) {
+    const oldestMessageId = runtime.replyDetailByMessageId.keys().next().value;
+    if (!oldestMessageId) {
+      break;
+    }
+    runtime.replyDetailByMessageId.delete(oldestMessageId);
+  }
+}
+
+function linkReplyDetailAlias(runtime, { aliasMessageId, sourceMessageId }) {
+  const normalizedAliasMessageId = normalizeReplyMessageId(aliasMessageId);
+  const normalizedSourceMessageId = normalizeReplyMessageId(sourceMessageId);
+  if (!normalizedAliasMessageId || !normalizedSourceMessageId) {
+    return;
+  }
+
+  const source = runtime.replyDetailByMessageId.get(normalizedSourceMessageId) || null;
+  if (!source) {
+    return;
+  }
+
+  const previous = runtime.replyDetailByMessageId.get(normalizedAliasMessageId) || null;
+  runtime.replyDetailByMessageId.set(normalizedAliasMessageId, {
+    ...source,
+    detailMessageId: normalizeReplyMessageId(previous?.detailMessageId || ""),
+  });
+}
+
+async function syncOpenReplyDetailCard(runtime, sourceMessageId) {
+  const normalizedMessageId = normalizeReplyMessageId(sourceMessageId);
+  if (!normalizedMessageId) {
+    return;
+  }
+
+  const detail = runtime.replyDetailByMessageId.get(normalizedMessageId) || null;
+  if (!detail?.detailMessageId) {
+    return;
+  }
+
+  const content = resolveReplyDetailContent(detail);
+  if (!content || Buffer.byteLength(content, "utf8") > ASSISTANT_REPLY_MAX_BYTES) {
+    return;
+  }
+
+  await patchInteractiveCard(runtime, {
+    messageId: detail.detailMessageId,
+    card: buildAssistantDetailCard({
+      text: content,
+      state: detail.state,
+    }),
+  });
+}
+
+function resolveReplyDetailContent(entry) {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const detailSnapshots = normalizeReplyDetailSnapshots(entry.detailSnapshots);
+  if (detailSnapshots.length) {
+    return detailSnapshots[detailSnapshots.length - 1].text;
+  }
+  const detailItems = normalizeReplyDetailItems(entry.detailItems);
+  if (detailItems.length) {
+    return detailItems[detailItems.length - 1].text;
+  }
+  const fullText = typeof entry.fullText === "string" ? entry.fullText : "";
+  if (fullText) {
+    return fullText;
+  }
+  const previewText = typeof entry.previewText === "string"
+    ? entry.previewText
+    : typeof entry.text === "string"
+      ? entry.text
+      : "";
+  if (previewText) {
+    return previewText;
+  }
+  if (entry.state === "failed") {
+    return "执行失败";
+  }
+  if (entry.state === "completed") {
+    return "执行完成";
+  }
+  return "";
+}
+
+function buildReplyDetailFileName(detail) {
+  const threadSuffix = normalizeFileFragment(detail?.threadId).slice(-8) || "reply";
+  const turnSuffix = normalizeFileFragment(detail?.turnId).slice(-8) || "turn";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `codex-output-${threadSuffix}-${turnSuffix}-${timestamp}.md`;
+}
+
+function normalizeFileFragment(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]+/g, "");
+}
+
+function normalizeReplyMessageId(messageId) {
+  return typeof messageId === "string" && messageId.trim()
+    ? messageId.trim().split(":")[0]
+    : "";
+}
+
+function captureReplySnapshot(entry) {
+  if (!entry || typeof entry !== "object") {
+    return;
+  }
+
+  if (!Array.isArray(entry.detailSnapshots)) {
+    entry.detailSnapshots = [];
+  }
+
+  const text = resolveSnapshotText(entry);
+  if (!text) {
+    return;
+  }
+
+  const previous = entry.detailSnapshots[entry.detailSnapshots.length - 1] || null;
+  if (previous && previous.text === text && previous.state === (entry.state || "streaming")) {
+    return;
+  }
+
+  entry.detailSnapshots.push({
+    text,
+    state: entry.state || "streaming",
+    updatedAt: new Date().toISOString(),
+  });
+  while (entry.detailSnapshots.length > MAX_REPLY_DETAIL_SNAPSHOTS) {
+    entry.detailSnapshots.shift();
+  }
+}
+
+function resolveSnapshotText(entry) {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const detailItems = normalizeReplyDetailItems(entry.detailItems);
+  if (detailItems.length > 1) {
+    return detailItems.map((item) => item.text).join("\n\n");
+  }
+  if (detailItems.length === 1) {
+    return detailItems[0].text;
+  }
+  const fullText = typeof entry.fullText === "string" ? entry.fullText.trim() : "";
+  if (fullText) {
+    return fullText;
+  }
+  const previewText = typeof entry.text === "string" ? entry.text.trim() : "";
+  return previewText;
+}
+
+function upsertReplyDetailItem(entry, { itemId = "", text = "", mode = "replace" } = {}) {
+  if (!entry || typeof text !== "string" || !text) {
+    return null;
+  }
+
+  if (!Array.isArray(entry.detailItems)) {
+    entry.detailItems = [];
+  }
+
+  const normalizedItemId = normalizeReplyItemId(itemId);
+  let detailItem = normalizedItemId
+    ? entry.detailItems.find((candidate) => candidate.itemId === normalizedItemId) || null
+    : entry.detailItems[entry.detailItems.length - 1] || null;
+
+  if (!detailItem) {
+    detailItem = {
+      itemId: normalizedItemId || `assistant-${entry.detailItems.length + 1}`,
+      text: "",
+    };
+    entry.detailItems.push(detailItem);
+    while (entry.detailItems.length > MAX_REPLY_DETAIL_ITEMS) {
+      entry.detailItems.shift();
+    }
+  }
+
+  detailItem.text = mergeReplyDetailText(detailItem.text, text, { mode });
+  return detailItem;
+}
+
+function normalizeReplyItemId(itemId) {
+  return typeof itemId === "string" && itemId.trim() ? itemId.trim() : "";
+}
+
+function normalizeReplyDetailItems(detailItems) {
+  if (!Array.isArray(detailItems)) {
+    return [];
+  }
+  return detailItems
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      itemId: normalizeReplyItemId(item.itemId),
+      text: typeof item.text === "string" ? item.text.trim() : "",
+    }))
+    .filter((item) => item.text);
+}
+
+function cloneReplyDetailItems(detailItems) {
+  return normalizeReplyDetailItems(detailItems).map((item) => ({ ...item }));
+}
+
+function formatReplyDetailItems(detailItems) {
+  const lastIndex = detailItems.length - 1;
+  return detailItems.map((item, index) => {
+    const title = index === lastIndex ? "**最终输出**" : `**过程 ${index + 1}**`;
+    return [
+      title,
+      "",
+      item.text,
+    ].join("\n");
+  }).join("\n\n---\n\n");
+}
+
+function normalizeReplyDetailSnapshots(detailSnapshots) {
+  if (!Array.isArray(detailSnapshots)) {
+    return [];
+  }
+  return detailSnapshots
+    .filter((snapshot) => snapshot && typeof snapshot === "object")
+    .map((snapshot) => ({
+      text: typeof snapshot.text === "string" ? snapshot.text.trim() : "",
+      state: typeof snapshot.state === "string" ? snapshot.state.trim() : "streaming",
+      updatedAt: typeof snapshot.updatedAt === "string" ? snapshot.updatedAt.trim() : "",
+    }))
+    .filter((snapshot) => snapshot.text);
+}
+
+function cloneReplyDetailSnapshots(detailSnapshots) {
+  return normalizeReplyDetailSnapshots(detailSnapshots).map((snapshot) => ({ ...snapshot }));
+}
+
+function formatReplyDetailSnapshots(detailSnapshots) {
+  const lastIndex = detailSnapshots.length - 1;
+  return detailSnapshots.map((snapshot, index) => {
+    const title = index === lastIndex ? "**最终快照**" : `**流式快照 ${index + 1}**`;
+    return [
+      title,
+      "",
+      snapshot.text,
+    ].join("\n");
+  }).join("\n\n---\n\n");
+}
+
 
 module.exports = {
   addPendingReaction,
@@ -371,6 +805,8 @@ module.exports = {
   sendInfoCardMessage,
   sendInteractiveApprovalCard,
   sendInteractiveCard,
+  showAssistantReplyDetail,
+  linkReplyDetailAlias,
   updateInteractiveCard,
   upsertAssistantReplyCard,
 };

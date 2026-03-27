@@ -31,9 +31,19 @@ const THREAD_ACTION_CONFIG = Object.freeze({
     feedback: "正在切换线程...",
     alreadyCurrentText: "已经是当前线程，无需切换。",
   }),
+  inspect: Object.freeze({
+    feedback: "正在获取线程消息...",
+  }),
   messages: Object.freeze({
     feedback: "正在获取最近消息...",
     notCurrentText: "非当前线程，请先切换到该线程。",
+  }),
+});
+
+const REPLY_ACTION_CONFIG = Object.freeze({
+  show_full: Object.freeze({
+    feedback: "",
+    emptyText: "当前还没有可查看的完整输出，请稍后再试。",
   }),
 });
 
@@ -52,6 +62,7 @@ const WORKSPACE_ACTION_CONFIG = Object.freeze({
 
 module.exports = {
   PANEL_ACTION_CONFIG,
+  REPLY_ACTION_CONFIG,
   THREAD_ACTION_CONFIG,
   WORKSPACE_ACTION_CONFIG,
 };

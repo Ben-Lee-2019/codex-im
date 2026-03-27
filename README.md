@@ -23,6 +23,7 @@ Codex 操作都留在 本地，飞书只负责消息交互。
 - `/codex switch <threadId>` 切换线程
 - `/codex message` 查看最近几轮消息
 - `/codex new` 新建线程
+- `/codex long <prompt>` / `/codex long off` 线程级 long 模式
 - `/codex stop` 停止当前运行
 - `/codex model` / `/codex model update` / `/codex model <modelId>` 查看可用模型、刷新可用模型以及推理强度、设置模型
 - `/codex effort` / `/codex effort <low|medium|high|xhigh>` 设置推理强度
@@ -107,6 +108,8 @@ npm run feishu-bot
 - `/codex switch <threadId>`
 - `/codex message`
 - `/codex new`
+- `/codex long <prompt>`
+- `/codex long off`
 - `/codex stop`
 - `/codex model`
 - `/codex model update`
@@ -116,12 +119,17 @@ npm run feishu-bot
 - `/codex reject`
 - `/codex help`
 
+说明：
+
 ## 项目与线程模型
 
 - 一个飞书会话可以记住多个项目
 - 每个项目对应一个当前选中的 Codex 线程
 - 历史线程列表以 Codex `thread/list` 为准
 - 切换项目或线程后，后续普通消息继续发到当前线程
+- `long` 模式是线程级的，不是项目级的
+- `/codex new` 新建的线程默认不会继承上一个线程的 `long` 模式
+- `long` 模式下每个主线程会绑定一个 companion reviewer 线程；reviewer 线程会显示在线程列表里，但只读、不可切换为当前对话线程
 
 ## 工作方式
 

@@ -7,7 +7,7 @@ function normalizeFeishuTextEvent(event, config) {
     return null;
   }
 
-  const text = parseFeishuMessageText(message.content);
+  const text = normalizeIncomingText(parseFeishuMessageText(message.content));
   if (!text) {
     return null;
   }
@@ -16,6 +16,7 @@ function normalizeFeishuTextEvent(event, config) {
     provider: "feishu",
     workspaceId: config.defaultWorkspaceId,
     chatId: message.chat_id || "",
+    chatType: normalizeIdentifier(message.chat_type).toLowerCase(),
     threadKey: message.root_id || "",
     senderId: sender?.sender_id?.open_id || sender?.sender_id?.user_id || "",
     messageId: message.message_id || "",
@@ -60,11 +61,31 @@ function extractCardAction(data) {
       threadId: value.threadId || "",
     };
   }
+  if (value.kind === "reply") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+    };
+  }
   if (value.kind === "workspace") {
     return {
       kind: value.kind,
       action: value.action || "",
       workspaceRoot: value.workspaceRoot || "",
+    };
+  }
+  if (value.kind === "gpu") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+      jobId: value.jobId || "",
+    };
+  }
+  if (value.kind === "subagent") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+      threadId: value.threadId || "",
     };
   }
   return null;
@@ -88,6 +109,7 @@ function normalizeCardActionContext(data, config) {
     provider: "feishu",
     workspaceId: config.defaultWorkspaceId,
     chatId,
+    chatType: normalizeIdentifier(data?.context?.chat_type).toLowerCase(),
     threadKey: "",
     senderId,
     messageId,
@@ -110,6 +132,10 @@ function parseFeishuMessageText(rawContent) {
   }
 }
 
+function normalizeIncomingText(text) {
+  return String(text || "").trim();
+}
+
 function parseCommand(text) {
   const normalized = text.trim().toLowerCase();
   const prefixes = ["/codex "];
@@ -124,6 +150,7 @@ function parseCommand(text) {
     remove: ["remove"],
     send: ["send"],
     new: ["new"],
+    long: ["long"],
     model: ["model"],
     effort: ["effort"],
     approve: ["approve", "approve workspace"],
@@ -144,6 +171,9 @@ function parseCommand(text) {
   }
   if (matchesPrefixCommand(normalized, "send")) {
     return "send";
+  }
+  if (matchesPrefixCommand(normalized, "long")) {
+    return "long";
   }
   if (matchesPrefixCommand(normalized, "bind")) {
     return "bind";

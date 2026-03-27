@@ -23,6 +23,7 @@ class CodexRpcClient {
     this.pending = new Map();
     this.isReady = false;
     this.messageListeners = new Set();
+    this.closingTransport = false;
   }
 
   async connect() {
@@ -96,6 +97,10 @@ class CodexRpcClient {
 
     child.on("close", (code) => {
       this.isReady = false;
+      if (this.closingTransport) {
+        return;
+      }
+      this.rejectPendingRequests(new Error(`Codex app-server exited with code ${code}`));
       console.error(`[codex-im] codex app-server exited with code ${code}`);
     });
   }
@@ -115,6 +120,10 @@ class CodexRpcClient {
       });
       socket.on("close", () => {
         this.isReady = false;
+        if (this.closingTransport) {
+          return;
+        }
+        this.rejectPendingRequests(new Error("Codex websocket closed"));
       });
     });
   }
@@ -137,6 +146,12 @@ class CodexRpcClient {
     });
     await this.sendNotification("initialized", null);
     this.isReady = true;
+  }
+
+  async restart() {
+    await this.close();
+    await this.connect();
+    await this.initialize();
   }
 
   async sendUserMessage({
@@ -212,6 +227,58 @@ class CodexRpcClient {
     this.sendRaw(payload);
   }
 
+  async close() {
+    this.closingTransport = true;
+    this.isReady = false;
+    this.rejectPendingRequests(new Error("Codex RPC client transport closed"));
+
+    const socket = this.socket;
+    const child = this.child;
+    this.socket = null;
+    this.child = null;
+    this.stdoutBuffer = "";
+
+    if (socket && this.mode === "websocket") {
+      await new Promise((resolve) => {
+        const handleClose = () => {
+          socket.off("close", handleClose);
+          resolve();
+        };
+        socket.on("close", handleClose);
+        try {
+          socket.close();
+        } catch {
+          socket.off("close", handleClose);
+          resolve();
+        }
+      });
+    }
+
+    if (child) {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          resolve();
+        };
+        child.once("close", finish);
+        try {
+          child.stdin?.end();
+        } catch {}
+        try {
+          child.kill();
+        } catch {
+          finish();
+        }
+      });
+    }
+
+    this.closingTransport = false;
+  }
+
   sendRaw(payload) {
     if (this.mode === "websocket") {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
@@ -250,6 +317,14 @@ class CodexRpcClient {
       listener(parsed);
     }
   }
+
+  rejectPendingRequests(error) {
+    const normalizedError = error instanceof Error ? error : new Error(String(error || "Codex RPC request failed"));
+    for (const { reject } of this.pending.values()) {
+      reject(normalizedError);
+    }
+    this.pending.clear();
+  }
 }
 
 function createRequestId() {
@@ -265,6 +340,9 @@ function tryParseJson(rawMessage) {
 }
 
 function logCodexOutboundMessage(operation, payload) {
+  if (!isTruthyEnv(process.env.CODEX_IM_RPC_DEBUG_LOG)) {
+    return;
+  }
   try {
     console.log(`[codex-im] codex=> op=${operation} ${payload}`);
   } catch {
@@ -273,6 +351,9 @@ function logCodexOutboundMessage(operation, payload) {
 }
 
 function logCodexInboundMessage(message) {
+  if (!isTruthyEnv(process.env.CODEX_IM_RPC_DEBUG_LOG)) {
+    return;
+  }
   try {
     console.log(`[codex-im] codex<= ${JSON.stringify(message)}`);
   } catch {
@@ -281,8 +362,19 @@ function logCodexInboundMessage(message) {
 }
 
 function logCodexParseFailure(rawMessage) {
+  if (!isTruthyEnv(process.env.CODEX_IM_RPC_DEBUG_LOG)) {
+    return;
+  }
   const sample = String(rawMessage || "").slice(0, 300);
   console.warn(`[codex-im] codex<= [parse_failed] raw=${JSON.stringify(sample)}`);
+}
+
+function isTruthyEnv(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
 function resolveDefaultCodexCommand(env = process.env) {

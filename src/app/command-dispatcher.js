@@ -1,9 +1,12 @@
 const { normalizeWorkspacePath } = require("../shared/workspace-paths");
 const {
   PANEL_ACTION_CONFIG,
+  REPLY_ACTION_CONFIG,
   THREAD_ACTION_CONFIG,
   WORKSPACE_ACTION_CONFIG,
 } = require("./card-action-config");
+const gpuRuntime = require("../domain/gpu/gpu-service");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 
 const TEXT_COMMAND_HANDLER_METHODS = {
   stop: "handleStopCommand",
@@ -17,6 +20,7 @@ const TEXT_COMMAND_HANDLER_METHODS = {
   remove: "handleRemoveCommand",
   send: "handleSendCommand",
   new: "handleNewCommand",
+  long: "handleLongCommand",
   model: "handleModelCommand",
   effort: "handleEffortCommand",
   approve: "handleApprovalCommand",
@@ -25,8 +29,11 @@ const TEXT_COMMAND_HANDLER_METHODS = {
 
 const CARD_ACTION_KIND_METHODS = {
   panel: "handlePanelCardAction",
+  reply: "handleReplyCardAction",
   thread: "handleThreadCardAction",
   workspace: "handleWorkspaceCardAction",
+  gpu: "handleGpuCardAction",
+  subagent: "handleSubagentCardAction",
 };
 
 const PANEL_CARD_ACTIONS = {
@@ -68,6 +75,12 @@ const THREAD_CARD_ACTIONS = {
       runtime.switchThreadById(normalized, action.threadId, { replyToMessageId: normalized.messageId })
     ),
   },
+  inspect: {
+    feedback: THREAD_ACTION_CONFIG.inspect.feedback,
+    run: (runtime, normalized, action) => (
+      runtime.inspectThreadMessages(normalized, action.threadId, { replyToMessageId: normalized.messageId })
+    ),
+  },
   messages: {
     feedback: THREAD_ACTION_CONFIG.messages.feedback,
     validate: (runtime, normalized, action) => {
@@ -78,6 +91,13 @@ const THREAD_CARD_ACTIONS = {
       return null;
     },
     run: (runtime, normalized) => runtime.handleMessageCommand(normalized),
+  },
+};
+
+const REPLY_CARD_ACTIONS = {
+  show_full: {
+    feedback: REPLY_ACTION_CONFIG.show_full.feedback,
+    run: (runtime, normalized) => runtime.showAssistantReplyDetail(normalized),
   },
 };
 
@@ -132,6 +152,10 @@ function handlePanelCardAction(runtime, action, normalized) {
 
 function handleThreadCardAction(runtime, action, normalized) {
   return executeMappedCardAction(runtime, normalized, action, THREAD_CARD_ACTIONS);
+}
+
+function handleReplyCardAction(runtime, action, normalized) {
+  return executeMappedCardAction(runtime, normalized, action, REPLY_CARD_ACTIONS);
 }
 
 function handleWorkspaceCardAction(runtime, action, normalized) {
@@ -208,7 +232,10 @@ function buildPanelSelectAction({ command, feedback, missingValueText }) {
 module.exports = {
   dispatchTextCommand,
   dispatchCardAction,
+  handleGpuCardAction: gpuRuntime.handleGpuCardAction,
+  handleSubagentCardAction: subagentRuntime.handleSubagentCardAction,
   handlePanelCardAction,
+  handleReplyCardAction,
   handleThreadCardAction,
   handleWorkspaceCardAction,
 };

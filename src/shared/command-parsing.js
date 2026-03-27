@@ -22,6 +22,10 @@ function extractEffortValue(text) {
   return extractCommandArgument(text, "/codex effort ");
 }
 
+function extractLongValue(text) {
+  return extractCommandArgument(text, "/codex long ");
+}
+
 function extractCommandArgument(text, prefix) {
   const trimmed = String(text || "").trim();
   const normalizedPrefix = String(prefix || "").toLowerCase();
@@ -34,6 +38,7 @@ function extractCommandArgument(text, prefix) {
 module.exports = {
   extractBindPath,
   extractEffortValue,
+  extractLongValue,
   extractModelValue,
   extractRemoveWorkspacePath,
   extractSendPath,

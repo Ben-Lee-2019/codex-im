@@ -153,7 +153,12 @@ function cleanupThreadRuntimeState(runtime, threadId) {
   runtime.activeTurnIdByThreadId.delete(threadId);
   runtime.pendingChatContextByThreadId.delete(threadId);
   runtime.bindingKeyByThreadId.delete(threadId);
+  runtime.turnDeliveryModeByThreadId.delete(threadId);
   runtime.workspaceRootByThreadId.delete(threadId);
+  runtime.threadSessionPathByThreadId.delete(threadId);
+  runtime.threadHasExternalUpdatesByThreadId?.delete(threadId);
+  runtime.freshThreadIds?.delete(threadId);
+  runtime.placeholderThreadIds?.delete(threadId);
 
   for (const [runKey, entry] of runtime.replyCardByRunKey.entries()) {
     if (entry?.threadId === threadId) {

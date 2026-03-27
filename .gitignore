@@ -5,6 +5,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 .env
+.env.*
 .env.local
 .env.*.local
 !.env.example
@@ -16,3 +17,6 @@ dist/
 Thumbs.db
 /.idea/
 /sessions.json
+/.runtime/
+/logs/
+/codex-im.restart.log

@@ -1,6 +1,7 @@
 const { filterThreadsByWorkspaceRoot } = require("../../shared/workspace-paths");
 const { extractSwitchThreadId } = require("../../shared/command-parsing");
 const codexMessageUtils = require("../../infra/codex/message-utils");
+const fs = require("fs");
 
 const THREAD_SOURCE_KINDS = new Set([
   "app",
@@ -23,8 +24,47 @@ async function resolveWorkspaceThreadState(runtime, {
   autoSelectThread = true,
 }) {
   const threads = await refreshWorkspaceThreads(runtime, bindingKey, workspaceRoot, normalized);
-  const selectedThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
-  const threadId = selectedThreadId || (autoSelectThread ? (threads[0]?.id || "") : "");
+  const storedThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
+  const selection = runtime.resolveConversationThreadSelection({
+    threads,
+    selectedThreadId: storedThreadId,
+    reviewerMainThreadIdByReviewerThreadId: runtime.reviewerMainThreadIdByReviewerThreadId,
+  });
+  let selectedThreadId = selection.selectedThreadId;
+  let threadId = autoSelectThread ? selection.threadId : selectedThreadId;
+  const storedPlaceholderThread = storedThreadId
+    ? threads.find((thread) => thread.id === storedThreadId && thread.isPlaceholder) || null
+    : null;
+  if (storedPlaceholderThread && !runtime.isReviewerThreadId(storedThreadId)) {
+    const isFreshPlaceholder = runtime.freshThreadIds?.has(storedThreadId) === true;
+    const placeholderIsReachable = isFreshPlaceholder || await probePlaceholderThread(runtime, storedThreadId);
+    if (placeholderIsReachable) {
+      selectedThreadId = storedThreadId;
+      threadId = storedThreadId;
+    } else {
+      selectedThreadId = "";
+      threadId = autoSelectThread ? "" : selectedThreadId;
+    }
+  }
+  const hasVisibleStoredThread = !!storedThreadId && threads.some(
+    (thread) => thread.id === storedThreadId && !thread.isPlaceholder
+  );
+  if (hasVisibleStoredThread && !runtime.isReviewerThreadId(storedThreadId)) {
+    selectedThreadId = storedThreadId;
+    threadId = storedThreadId;
+  }
+  if (storedThreadId && storedThreadId !== selectedThreadId) {
+    if (selectedThreadId) {
+      runtime.sessionStore.setThreadIdForWorkspace(
+        bindingKey,
+        workspaceRoot,
+        selectedThreadId,
+        codexMessageUtils.buildBindingMetadata(normalized)
+      );
+    } else {
+      runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+    }
+  }
   if (!selectedThreadId && threadId) {
     runtime.sessionStore.setThreadIdForWorkspace(
       bindingKey,
@@ -36,73 +76,172 @@ async function resolveWorkspaceThreadState(runtime, {
   if (threadId) {
     runtime.setThreadBindingKey(threadId, bindingKey);
     runtime.setThreadWorkspaceRoot(threadId, workspaceRoot);
+    const resolvedThread = threads.find((thread) => thread.id === threadId) || null;
+    if (resolvedThread?.isPlaceholder) {
+      runtime.placeholderThreadIds?.add(threadId);
+    } else {
+      runtime.placeholderThreadIds?.delete(threadId);
+    }
   }
-  return { threads, threadId, selectedThreadId };
+  appendThreadDebugLog({
+    stage: "resolveWorkspaceThreadState",
+    bindingKey,
+    workspaceRoot,
+    text: normalizeDebugText(normalized?.text),
+    storedThreadId,
+    threadIds: threads.map((thread) => thread.id),
+    selectedThreadId,
+    resolvedThreadId: threadId,
+    hasVisibleStoredThread,
+  });
+  return { threads, threadId, selectedThreadId: selectedThreadId || threadId };
 }
 
-async function ensureThreadAndSendMessage(runtime, { bindingKey, workspaceRoot, normalized, threadId }) {
-  const codexParams = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
-
-  if (!threadId) {
-    const createdThreadId = await createWorkspaceThread(runtime, {
-      bindingKey,
-      workspaceRoot,
-      normalized,
-    });
-    console.log(`[codex-im] turn/start first message thread=${createdThreadId}`);
-    await runtime.codex.sendUserMessage({
-      threadId: createdThreadId,
-      text: normalized.text,
-      model: codexParams.model || null,
-      effort: codexParams.effort || null,
-      accessMode: runtime.config.defaultCodexAccessMode,
-      workspaceRoot,
-    });
-    runtime.setThreadBindingKey(createdThreadId, bindingKey);
-    runtime.setThreadWorkspaceRoot(createdThreadId, workspaceRoot);
-    return createdThreadId;
+async function probePlaceholderThread(runtime, threadId) {
+  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+  if (!normalizedThreadId || typeof runtime.codex?.resumeThread !== "function") {
+    return false;
   }
 
   try {
-    await ensureThreadResumed(runtime, threadId);
-    await runtime.codex.sendUserMessage({
-      threadId,
-      text: normalized.text,
-      model: codexParams.model || null,
-      effort: codexParams.effort || null,
-      accessMode: runtime.config.defaultCodexAccessMode,
-      workspaceRoot,
+    const { response, sessionPath } = await resumeThreadWithSessionValidation(runtime, normalizedThreadId);
+    appendThreadDebugLog({
+      stage: "resolveWorkspaceThreadState:placeholder_probe_ok",
+      threadId: normalizedThreadId,
+      sessionPath,
     });
+    return true;
+  } catch (error) {
+    appendThreadDebugLog({
+      stage: "resolveWorkspaceThreadState:placeholder_probe_failed",
+      threadId: normalizedThreadId,
+      error: String(error?.message || error),
+    });
+    return false;
+  }
+}
+
+async function ensureThreadAndSendMessage(runtime, {
+  bindingKey,
+  workspaceRoot,
+  normalized,
+  threadId,
+  reviewSendOptions = {},
+}) {
+  const codexParams = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+  const deliveryMode = resolveTurnDeliveryMode(normalized);
+
+  if (!threadId) {
+    appendThreadDebugLog({
+      stage: "ensureThreadAndSendMessage:missing_thread",
+      bindingKey,
+      workspaceRoot,
+      text: normalizeDebugText(normalized?.text),
+      requestedThreadId: "",
+    });
+    throw new Error("当前会话没有已选中的 Codex 线程；不会自动新建。请先发送 `/codex new` 或 `/codex switch <threadId>`。");
+  }
+
+  try {
+    appendThreadDebugLog({
+      stage: "ensureThreadAndSendMessage:resume",
+      bindingKey,
+      workspaceRoot,
+      text: normalizeDebugText(normalized?.text),
+      requestedThreadId: threadId,
+    });
+    await runtime.refreshCodexClientIfThreadStale?.({ threadId });
+    await ensureThreadResumed(runtime, threadId);
+    if (reviewSendOptions.enableLongModeForMainThread) {
+      await runtime.ensureLongModeForMainThread({
+        bindingKey,
+        workspaceRoot,
+        mainThreadId: threadId,
+      });
+    }
+    await prepareTurnDelivery(runtime, {
+      bindingKey,
+      workspaceRoot,
+      threadId,
+      normalized,
+      deliveryMode,
+    });
+    try {
+      const outgoingText = buildOutgoingUserText(normalized);
+      await runtime.codex.sendUserMessage({
+        threadId,
+        text: outgoingText,
+        model: codexParams.model || null,
+        effort: codexParams.effort || null,
+        accessMode: runtime.config.defaultCodexAccessMode,
+        workspaceRoot,
+      });
+    } catch (error) {
+      runtime.turnDeliveryModeByThreadId.delete(threadId);
+      throw error;
+    }
+    runtime.recordAcceptedSend({
+      bindingKey,
+      workspaceRoot,
+      threadId,
+      normalized,
+      reviewSendOptions,
+    });
+    runtime.clearThreadExternalUpdates?.(threadId);
+    runtime.freshThreadIds?.delete(threadId);
+    runtime.placeholderThreadIds?.delete(threadId);
     console.log(`[codex-im] turn/start ok workspace=${workspaceRoot} thread=${threadId}`);
     runtime.setThreadBindingKey(threadId, bindingKey);
     runtime.setThreadWorkspaceRoot(threadId, workspaceRoot);
     return threadId;
   } catch (error) {
-    if (!shouldRecreateThread(error)) {
-      throw error;
-    }
-
-    console.warn(`[codex-im] stale thread detected, recreating workspace thread: ${threadId}`);
-    runtime.resumedThreadIds.delete(threadId);
-    runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
-    const recreatedThreadId = await createWorkspaceThread(runtime, {
+    appendThreadDebugLog({
+      stage: "ensureThreadAndSendMessage:error",
       bindingKey,
       workspaceRoot,
-      normalized,
+      text: normalizeDebugText(normalized?.text),
+      requestedThreadId: threadId,
+      error: String(error?.message || error),
     });
-    console.log(`[codex-im] turn/start retry thread=${recreatedThreadId}`);
-    await runtime.codex.sendUserMessage({
-      threadId: recreatedThreadId,
-      text: normalized.text,
-      model: codexParams.model || null,
-      effort: codexParams.effort || null,
-      accessMode: runtime.config.defaultCodexAccessMode,
-      workspaceRoot,
-    });
-    runtime.setThreadBindingKey(recreatedThreadId, bindingKey);
-    runtime.setThreadWorkspaceRoot(recreatedThreadId, workspaceRoot);
-    return recreatedThreadId;
+    runtime.turnDeliveryModeByThreadId.delete(threadId);
+    throw error;
   }
+}
+
+async function prepareTurnDelivery(runtime, {
+  bindingKey,
+  workspaceRoot,
+  threadId,
+  normalized,
+  deliveryMode,
+}) {
+  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+  if (!bindingKey || !workspaceRoot || !normalizedThreadId) {
+    return;
+  }
+
+  runtime.turnDeliveryModeByThreadId.set(normalizedThreadId, deliveryMode);
+  if (deliveryMode === "live") {
+    runtime.rememberFeishuPromptFingerprint({
+      threadId: normalizedThreadId,
+      text: normalized?.text || "",
+    });
+  }
+
+  await runtime.primeSessionSyncCursor({
+    bindingKey,
+    workspaceRoot,
+    threadId: normalizedThreadId,
+    sessionPath: runtime.threadSessionPathByThreadId.get(normalizedThreadId) || "",
+  });
+}
+
+function resolveTurnDeliveryMode(normalized) {
+  return normalized?.provider === "feishu" ? "live" : "session";
+}
+
+function buildOutgoingUserText(normalized) {
+  return typeof normalized?.text === "string" ? normalized.text : "";
 }
 
 async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, normalized }) {
@@ -115,6 +254,7 @@ async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, norma
   if (!resolvedThreadId) {
     throw new Error("thread/start did not return a thread id");
   }
+  const sessionPath = codexMessageUtils.extractThreadPath(response);
 
   runtime.sessionStore.setThreadIdForWorkspace(
     bindingKey,
@@ -123,22 +263,58 @@ async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, norma
     codexMessageUtils.buildBindingMetadata(normalized)
   );
   runtime.resumedThreadIds.add(resolvedThreadId);
+  runtime.freshThreadIds?.add(resolvedThreadId);
+  runtime.placeholderThreadIds?.add(resolvedThreadId);
   runtime.setPendingThreadContext(resolvedThreadId, normalized);
   runtime.setThreadBindingKey(resolvedThreadId, bindingKey);
   runtime.setThreadWorkspaceRoot(resolvedThreadId, workspaceRoot);
+  if (sessionPath) {
+    runtime.threadSessionPathByThreadId.set(resolvedThreadId, sessionPath);
+  }
   return resolvedThreadId;
 }
 
 async function ensureThreadResumed(runtime, threadId) {
   const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
-  if (!normalizedThreadId || runtime.resumedThreadIds.has(normalizedThreadId)) {
+  if (!normalizedThreadId) {
+    return null;
+  }
+  if (runtime.freshThreadIds?.has(normalizedThreadId) || runtime.placeholderThreadIds?.has(normalizedThreadId)) {
     return null;
   }
 
-  const response = await runtime.codex.resumeThread({ threadId: normalizedThreadId });
-  runtime.resumedThreadIds.add(normalizedThreadId);
+  const { response, sessionPath } = await resumeThreadWithSessionValidation(runtime, normalizedThreadId);
   console.log(`[codex-im] thread/resume ok thread=${normalizedThreadId}`);
   return response;
+}
+
+async function resumeThreadWithSessionValidation(runtime, threadId) {
+  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+  if (!normalizedThreadId) {
+    return { response: null, sessionPath: "" };
+  }
+
+  let response = await runtime.codex.resumeThread({ threadId: normalizedThreadId });
+  runtime.resumedThreadIds?.add(normalizedThreadId);
+  let sessionPath = codexMessageUtils.extractThreadPath(response);
+  if (sessionPath) {
+    runtime.threadSessionPathByThreadId.set(normalizedThreadId, sessionPath);
+  }
+
+  const sanitized = sessionPath
+    ? await sanitizeSessionFileIfNeeded(sessionPath, {
+      threadId: normalizedThreadId,
+    })
+    : false;
+  if (sanitized) {
+    response = await runtime.codex.resumeThread({ threadId: normalizedThreadId });
+    sessionPath = codexMessageUtils.extractThreadPath(response);
+    if (sessionPath) {
+      runtime.threadSessionPathByThreadId.set(normalizedThreadId, sessionPath);
+    }
+  }
+
+  return { response, sessionPath };
 }
 
 async function handleNewCommand(runtime, normalized) {
@@ -164,7 +340,6 @@ async function handleNewCommand(runtime, normalized) {
       replyToMessageId: normalized.messageId,
       text: `已创建新线程并切换到它:\n${workspaceRoot}\n\nthread: ${createdThreadId}`,
     });
-    await runtime.showStatusPanel(normalized, { replyToMessageId: normalized.messageId });
   } catch (error) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
@@ -192,15 +367,128 @@ async function refreshWorkspaceThreads(runtime, bindingKey, workspaceRoot, norma
   try {
     const threads = await listCodexThreadsForWorkspace(runtime, workspaceRoot);
     const currentThreadId = runtime.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
-    const shouldKeepCurrentThread = currentThreadId && runtime.resumedThreadIds.has(currentThreadId);
-    if (currentThreadId && !shouldKeepCurrentThread && !threads.some((thread) => thread.id === currentThreadId)) {
-      runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+    if (!currentThreadId || threads.some((thread) => thread.id === currentThreadId)) {
+      appendThreadDebugLog({
+        stage: "refreshWorkspaceThreads:list",
+        bindingKey,
+        workspaceRoot,
+        text: normalizeDebugText(normalized?.text),
+        currentThreadId,
+        threadIds: threads.map((thread) => thread.id),
+      });
+      return threads;
     }
-    return threads;
+
+    appendThreadDebugLog({
+      stage: "refreshWorkspaceThreads:placeholder",
+      bindingKey,
+      workspaceRoot,
+      text: normalizeDebugText(normalized?.text),
+      currentThreadId,
+      threadIds: threads.map((thread) => thread.id),
+    });
+    return [
+      {
+        id: currentThreadId,
+        cwd: workspaceRoot,
+        title: currentThreadId,
+        createdAt: 0,
+        updatedAt: 0,
+        sourceKind: "unknown",
+        parentThreadId: "",
+        statusType: "unknown",
+        path: runtime.threadSessionPathByThreadId.get(currentThreadId) || "",
+        agentNickname: "",
+        agentRole: "",
+        isPlaceholder: true,
+      },
+      ...threads,
+    ];
   } catch (error) {
     console.warn(`[codex-im] thread/list failed for workspace=${workspaceRoot}: ${error.message}`);
-    return [];
+    const currentThreadId = runtime.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+    appendThreadDebugLog({
+      stage: "refreshWorkspaceThreads:error",
+      bindingKey,
+      workspaceRoot,
+      text: normalizeDebugText(normalized?.text),
+      currentThreadId,
+      error: String(error?.message || error),
+    });
+    if (!currentThreadId) {
+      return [];
+    }
+    return [{
+      id: currentThreadId,
+      cwd: workspaceRoot,
+      title: currentThreadId,
+      createdAt: 0,
+      updatedAt: 0,
+      sourceKind: "unknown",
+      parentThreadId: "",
+      statusType: "unknown",
+      path: runtime.threadSessionPathByThreadId.get(currentThreadId) || "",
+      agentNickname: "",
+      agentRole: "",
+      isPlaceholder: true,
+    }];
   }
+}
+
+function appendThreadDebugLog(payload) {
+  const logPath = "/tmp/codex-im-thread-debug.log";
+  const record = {
+    timestamp: new Date().toISOString(),
+    ...payload,
+  };
+  try {
+    fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`);
+  } catch {}
+}
+
+function normalizeDebugText(text) {
+  const normalized = typeof text === "string" ? text.trim().replace(/\s+/g, " ") : "";
+  return normalized.slice(0, 160);
+}
+
+async function sanitizeSessionFileIfNeeded(sessionPath, { threadId = "" } = {}) {
+  const normalizedSessionPath = typeof sessionPath === "string" ? sessionPath.trim() : "";
+  if (!normalizedSessionPath) {
+    return false;
+  }
+
+  const raw = await fs.promises.readFile(normalizedSessionPath);
+  const nulCount = countNulBytes(raw);
+  if (!nulCount) {
+    return false;
+  }
+
+  const sanitized = Buffer.from(raw.filter((byte) => byte !== 0));
+  const tempPath = `${normalizedSessionPath}.sanitize-${process.pid}-${Date.now()}`;
+  await fs.promises.writeFile(tempPath, sanitized);
+  await fs.promises.rename(tempPath, normalizedSessionPath);
+  appendThreadDebugLog({
+    stage: "sanitizeSessionFileIfNeeded",
+    threadId,
+    sessionPath: normalizedSessionPath,
+    nulCount,
+    originalBytes: raw.length,
+    sanitizedBytes: sanitized.length,
+  });
+  return true;
+}
+
+function countNulBytes(buffer) {
+  if (!buffer || typeof buffer.length !== "number") {
+    return 0;
+  }
+  let count = 0;
+  for (const byte of buffer) {
+    if (byte === 0) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 async function listCodexThreadsForWorkspace(runtime, workspaceRoot) {
@@ -287,6 +575,14 @@ async function switchThreadById(runtime, normalized, threadId, { replyToMessageI
     });
     return;
   }
+  if (runtime.isReviewerThreadId(threadId)) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: replyTarget,
+      text: "Reviewer 线程是只读的，可以查看记录，但不能切换成当前对话线程。",
+    });
+    return;
+  }
 
   const resolvedWorkspaceRoot = selectedThread.cwd || workspaceRoot;
   runtime.sessionStore.setActiveWorkspaceRoot(bindingKey, resolvedWorkspaceRoot);
@@ -299,18 +595,60 @@ async function switchThreadById(runtime, normalized, threadId, { replyToMessageI
   runtime.setThreadBindingKey(threadId, bindingKey);
   runtime.setThreadWorkspaceRoot(threadId, resolvedWorkspaceRoot);
   runtime.resumedThreadIds.delete(threadId);
+  runtime.freshThreadIds?.delete(threadId);
+  runtime.placeholderThreadIds?.delete(threadId);
   await ensureThreadResumed(runtime, threadId);
   await runtime.showStatusPanel(normalized, { replyToMessageId: replyTarget });
+}
+
+async function inspectThreadMessages(runtime, normalized, threadId, { replyToMessageId } = {}) {
+  const replyTarget = runtime.resolveReplyToMessageId(normalized, replyToMessageId);
+  const { bindingKey, workspaceRoot } = runtime.getBindingContext(normalized);
+  if (!workspaceRoot) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: replyTarget,
+      text: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+    });
+    return;
+  }
+
+  const threads = await refreshWorkspaceThreads(runtime, bindingKey, workspaceRoot, normalized);
+  const targetThreadId = typeof threadId === "string" && threadId.trim()
+    ? threadId.trim()
+    : runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
+  if (!targetThreadId) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: replyTarget,
+      text: `当前项目：\`${workspaceRoot}\`\n\n该项目还没有可查看的线程消息。`,
+    });
+    return;
+  }
+
+  const targetThread = threads.find((thread) => thread.id === targetThreadId) || { id: targetThreadId };
+  runtime.resumedThreadIds.delete(targetThreadId);
+  runtime.freshThreadIds?.delete(targetThreadId);
+  runtime.placeholderThreadIds?.delete(targetThreadId);
+  const resumeResponse = await runtime.codex.resumeThread({ threadId: targetThreadId });
+  runtime.resumedThreadIds.add(targetThreadId);
+  const recentMessages = codexMessageUtils.extractRecentConversationFromResumeResponse(resumeResponse);
+  const displayThread = runtime.decorateThreadForDisplay(targetThread);
+
+  await runtime.sendInfoCardMessage({
+    chatId: normalized.chatId,
+    replyToMessageId: replyTarget,
+    text: runtime.buildThreadMessagesSummary({
+      workspaceRoot,
+      thread: displayThread,
+      recentMessages,
+    }),
+  });
 }
 
 function isSupportedThreadSourceKind(sourceKind) {
   const normalized = typeof sourceKind === "string" && sourceKind.trim() ? sourceKind.trim() : "unknown";
   return THREAD_SOURCE_KINDS.has(normalized);
-}
-
-function shouldRecreateThread(error) {
-  const message = String(error?.message || "").toLowerCase();
-  return message.includes("thread not found") || message.includes("unknown thread");
 }
 
 module.exports = {
@@ -320,6 +658,7 @@ module.exports = {
   ensureThreadResumed,
   handleNewCommand,
   handleSwitchCommand,
+  inspectThreadMessages,
   refreshWorkspaceThreads,
   resolveWorkspaceThreadState,
   switchThreadById,

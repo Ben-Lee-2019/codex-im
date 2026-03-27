@@ -40,5 +40,6 @@ function clipUtf8ByBytes(input, maxBytes) {
 }
 
 module.exports = {
+  ASSISTANT_REPLY_MAX_BYTES,
   sanitizeAssistantMarkdown,
 };

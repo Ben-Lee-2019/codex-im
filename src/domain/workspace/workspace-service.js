@@ -43,6 +43,12 @@ async function resolveWorkspaceContext(
     return null;
   }
 
+  runtime.sessionStore.setDeliveryContextForWorkspace(bindingKey, workspaceRoot, {
+    chatId: normalized.chatId,
+    threadKey: normalized.threadKey,
+    lastSourceMessageId: replyTarget,
+  });
+
   return { bindingKey, workspaceRoot, replyTarget };
 }
 
@@ -124,12 +130,14 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
     normalized,
     autoSelectThread: true,
   });
-  const currentThread = threads.find((thread) => thread.id === threadId) || null;
+  const displayThreads = threads.map((thread) => runtime.decorateThreadForDisplay(thread));
+  const currentThread = displayThreads.find((thread) => thread.id === threadId) || null;
   const recentThreads = currentThread
-    ? threads.filter((thread) => thread.id !== threadId).slice(0, 2)
-    : threads.slice(0, 3);
+    ? displayThreads.filter((thread) => thread.id !== threadId).slice(0, 2)
+    : displayThreads.slice(0, 3);
   const status = runtime.describeWorkspaceStatus(threadId);
   const codexParams = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+  const longModeRecord = threadId ? runtime.getLongModeRecord(threadId) : null;
   const availableCatalog = runtime.sessionStore.getAvailableModelCatalog();
   const availableModels = Array.isArray(availableCatalog?.models) ? availableCatalog.models : [];
   const modelOptions = buildModelSelectOptions(availableModels);
@@ -147,49 +155,15 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
       recentThreads,
       totalThreadCount: threads.length,
       status,
+      longModeEnabled: longModeRecord?.enabled === true,
       noticeText,
     }),
   });
 }
 
 async function handleMessageCommand(runtime, normalized) {
-  const workspaceContext = await resolveWorkspaceContext(runtime, normalized, {
+  await runtime.inspectThreadMessages(normalized, "", {
     replyToMessageId: normalized.messageId,
-  });
-  if (!workspaceContext) {
-    return;
-  }
-  const { bindingKey, workspaceRoot } = workspaceContext;
-
-  const { threads, threadId } = await runtime.resolveWorkspaceThreadState({
-    bindingKey,
-    workspaceRoot,
-    normalized,
-    autoSelectThread: true,
-  });
-
-  if (!threadId) {
-    await runtime.sendInfoCardMessage({
-      chatId: normalized.chatId,
-      replyToMessageId: normalized.messageId,
-      text: `当前项目：\`${workspaceRoot}\`\n\n该项目还没有可查看的线程消息。`,
-    });
-    return;
-  }
-
-  const currentThread = threads.find((thread) => thread.id === threadId) || { id: threadId };
-  runtime.resumedThreadIds.delete(threadId);
-  const resumeResponse = await runtime.ensureThreadResumed(threadId);
-  const recentMessages = codexMessageUtils.extractRecentConversationFromResumeResponse(resumeResponse);
-
-  await runtime.sendInfoCardMessage({
-    chatId: normalized.chatId,
-    replyToMessageId: normalized.messageId,
-    text: runtime.buildThreadMessagesSummary({
-      workspaceRoot,
-      thread: currentThread,
-      recentMessages,
-    }),
   });
 }
 
@@ -458,7 +432,12 @@ async function showThreadPicker(runtime, normalized, { replyToMessageId } = {}) 
   }
 
   const threads = await runtime.refreshWorkspaceThreads(bindingKey, workspaceRoot, normalized);
-  const currentThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot) || threads[0]?.id || "";
+  const selection = runtime.resolveConversationThreadSelection({
+    threads,
+    selectedThreadId: runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot),
+    reviewerMainThreadIdByReviewerThreadId: runtime.reviewerMainThreadIdByReviewerThreadId,
+  });
+  const currentThreadId = selection.threadId;
   if (!threads.length) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
@@ -473,7 +452,7 @@ async function showThreadPicker(runtime, normalized, { replyToMessageId } = {}) 
     replyToMessageId: replyTarget,
     card: runtime.buildThreadPickerCard({
       workspaceRoot,
-      threads,
+      threads: threads.map((thread) => runtime.decorateThreadForDisplay(thread)),
       currentThreadId,
     }),
   });

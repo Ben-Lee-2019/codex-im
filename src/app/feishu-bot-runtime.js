@@ -2,15 +2,21 @@ const { readConfig } = require("../infra/config/config");
 const { SessionStore } = require("../infra/storage/session-store");
 const { CodexRpcClient } = require("../infra/codex/rpc-client");
 const {
+  buildExternalInputCard,
   buildCardResponse,
   buildCardToast,
   buildEffortInfoText,
   buildEffortListText,
   buildEffortValidationErrorText,
+  buildGpuJobListCard,
+  buildGpuMonitorCard,
+  buildSubagentStatusCard,
+  buildSubagentTranscriptCard,
   buildHelpCardText,
   buildModelInfoText,
   buildModelListText,
   buildModelValidationErrorText,
+  buildReviewVerdictCard,
   buildStatusPanelCard,
   buildThreadMessagesSummary,
   buildThreadPickerCard,
@@ -23,6 +29,7 @@ const {
   clearPendingReactionForThread,
   disposeReplyRunState,
   handleCardAction,
+  linkReplyDetailAlias,
   movePendingReactionToThread,
   patchInteractiveCard,
   queueCardActionWithFeedback,
@@ -32,6 +39,7 @@ const {
   sendInfoCardMessage,
   sendInteractiveApprovalCard,
   sendInteractiveCard,
+  showAssistantReplyDetail,
   updateInteractiveCard,
   upsertAssistantReplyCard,
 } = require("../presentation/card/card-service");
@@ -40,7 +48,11 @@ const {
   patchWsClientForCardCallbacks,
 } = require("../infra/feishu/client-adapter");
 const runtimeCommands = require("./command-dispatcher");
+const externalSyncRuntime = require("./external-sync-service");
 const approvalRuntime = require("../domain/approval/approval-service");
+const gpuRuntime = require("../domain/gpu/gpu-service");
+const reviewRuntime = require("../domain/review/review-service");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 const runtimeState = require("../domain/session/binding-context");
 const threadRuntime = require("../domain/thread/thread-service");
 const workspaceRuntime = require("../domain/workspace/workspace-service");
@@ -68,15 +80,42 @@ class FeishuBotRuntime {
     this.activeTurnIdByThreadId = new Map();
     this.pendingApprovalByThreadId = new Map();
     this.replyCardByRunKey = new Map();
+    this.replyDetailByMessageId = new Map();
     this.currentRunKeyByThreadId = new Map();
     this.replyFlushTimersByRunKey = new Map();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
+    this.threadSessionPathByThreadId = new Map();
+    this.turnDeliveryModeByThreadId = new Map();
+    this.recentFeishuPromptFingerprintsByThreadId = new Map();
+    this.recentLiveDeliveredTurnAtByRunKey = new Map();
+    this.externalSyncPartialChunkByThreadId = new Map();
+    this.externalSummaryLabelByThreadId = new Map();
+    this.threadHasExternalUpdatesByThreadId = new Map();
+    this.externalSessionSyncTimer = null;
+    this.externalSessionSyncInFlight = false;
     this.approvalAllowlistByWorkspaceRoot = new Map();
     this.inFlightApprovalRequestKeys = new Set();
     this.resumedThreadIds = new Set();
+    this.freshThreadIds = new Set();
+    this.placeholderThreadIds = new Set();
+    this.gpuMonitorByChatId = new Map();
+    this.gpuMonitorTimerByChatId = new Map();
+    this.subagentTrackerByRunKey = new Map();
+    this.subagentPollTimerByRunKey = new Map();
+    this.subagentCardByThreadId = new Map();
+    this.subagentMetadataByThreadId = new Map();
+    this.subagentSessionMetaByPath = new Map();
+    this.longModeByMainThreadId = new Map();
+    this.reviewerMainThreadIdByReviewerThreadId = new Map();
+    this.reviewChainByMainThreadId = new Map();
+    this.pendingReviewDispatchByReviewerThreadId = new Map();
+    this.reviewAwaitingVerdictByReviewerThreadId = new Map();
+    this.reviewerBootstrapPendingThreadIds = new Set();
+    this.pendingSyntheticContinueChainIdByMainThreadId = new Map();
+    reviewRuntime.hydratePersistedLongMode(this);
     this.codex.onMessage((message) => appDispatcher.onCodexMessage(this, message));
   }
 
@@ -87,6 +126,7 @@ class FeishuBotRuntime {
     await this.codex.initialize();
     await this.refreshAvailableModelCatalogAtStartup();
     this.startLongConnection();
+    this.startExternalSessionSync();
     console.log(`[codex-im] feishu-bot runtime ready for app ${maskSecret(this.config.feishu.appId)}`);
   }
 
@@ -173,6 +213,32 @@ class FeishuBotRuntime {
     console.log(`[codex-im] model catalog refreshed at startup: ${models.length} entries`);
   }
 
+  markThreadHasExternalUpdates(threadId) {
+    const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+    if (!normalizedThreadId) {
+      return;
+    }
+    this.threadHasExternalUpdatesByThreadId.set(normalizedThreadId, new Date().toISOString());
+  }
+
+  clearThreadExternalUpdates(threadId) {
+    const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+    if (!normalizedThreadId) {
+      return;
+    }
+    this.threadHasExternalUpdatesByThreadId.delete(normalizedThreadId);
+  }
+
+  async refreshCodexClientIfThreadStale({ threadId }) {
+    const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+    if (!normalizedThreadId || !this.threadHasExternalUpdatesByThreadId.has(normalizedThreadId)) {
+      return;
+    }
+
+    console.log(`[codex-im] codex/restart for external thread update thread=${normalizedThreadId}`);
+    await this.codex.restart();
+  }
+
   resolveReplyToMessageId(normalized, replyToMessageId = "") {
     return replyToMessageId || normalized.messageId;
   }
@@ -216,15 +282,21 @@ function attachRuntimeForwarders() {
   const proto = FeishuBotRuntime.prototype;
 
   const plainForwarders = {
+    buildExternalInputCard,
     buildCardResponse,
     buildCardToast,
     buildEffortInfoText,
     buildEffortListText,
     buildEffortValidationErrorText,
+    buildGpuJobListCard,
+    buildGpuMonitorCard,
+    buildSubagentStatusCard,
+    buildSubagentTranscriptCard,
     buildHelpCardText,
     buildModelInfoText,
     buildModelListText,
     buildModelValidationErrorText,
+    buildReviewVerdictCard,
     buildStatusPanelCard,
     buildThreadMessagesSummary,
     buildThreadPickerCard,
@@ -269,14 +341,21 @@ function attachRuntimeForwarders() {
     handleSwitchCommand: threadRuntime.handleSwitchCommand,
     handleRemoveCommand: workspaceRuntime.handleRemoveCommand,
     handleSendCommand: workspaceRuntime.handleSendCommand,
+    handleLongCommand: reviewRuntime.handleLongCommand,
     handleModelCommand: workspaceRuntime.handleModelCommand,
     handleEffortCommand: workspaceRuntime.handleEffortCommand,
     refreshWorkspaceThreads: threadRuntime.refreshWorkspaceThreads,
+    inspectThreadMessages: threadRuntime.inspectThreadMessages,
     describeWorkspaceStatus: threadRuntime.describeWorkspaceStatus,
     switchThreadById: threadRuntime.switchThreadById,
     handleStopCommand: eventsRuntime.handleStopCommand,
     handleApprovalCommand: approvalRuntime.handleApprovalCommand,
     deliverToFeishu: eventsRuntime.deliverToFeishu,
+    startExternalSessionSync: externalSyncRuntime.startExternalSessionSync,
+    syncExternalSessions: externalSyncRuntime.syncExternalSessions,
+    primeSessionSyncCursor: externalSyncRuntime.primeSessionSyncCursor,
+    advanceSessionSyncCursorToEof: externalSyncRuntime.advanceSessionSyncCursorToEof,
+    rememberFeishuPromptFingerprint: externalSyncRuntime.rememberFeishuPromptFingerprint,
     sendInfoCardMessage,
     sendInteractiveApprovalCard,
     updateInteractiveCard,
@@ -284,7 +363,10 @@ function attachRuntimeForwarders() {
     patchInteractiveCard,
     handleCardAction,
     dispatchCardAction: runtimeCommands.dispatchCardAction,
+    handleGpuCardAction: gpuRuntime.handleGpuCardAction,
+    handleSubagentCardAction: subagentRuntime.handleSubagentCardAction,
     handlePanelCardAction: runtimeCommands.handlePanelCardAction,
+    handleReplyCardAction: runtimeCommands.handleReplyCardAction,
     handleThreadCardAction: runtimeCommands.handleThreadCardAction,
     handleWorkspaceCardAction: runtimeCommands.handleWorkspaceCardAction,
     queueCardActionWithFeedback,
@@ -294,7 +376,19 @@ function attachRuntimeForwarders() {
     sendCardActionFeedback,
     switchWorkspaceByPath: workspaceRuntime.switchWorkspaceByPath,
     removeWorkspaceByPath: workspaceRuntime.removeWorkspaceByPath,
+    ensureLongModeForMainThread: reviewRuntime.ensureLongModeForMainThread,
+    getLongModeRecord: reviewRuntime.getLongModeRecord,
+    handleMainTurnCompleted: reviewRuntime.handleMainTurnCompleted,
+    isReviewerThreadId: reviewRuntime.isReviewerThreadId,
+    decorateThreadForDisplay: reviewRuntime.decorateThreadForDisplay,
+    recordAcceptedSend: reviewRuntime.recordAcceptedSend,
+    resolveConversationThreadSelection: reviewRuntime.resolveConversationThreadSelection,
+    shouldSuppressReviewThreadDelivery: reviewRuntime.shouldSuppressUserDelivery,
+    handleReviewSuppressedMessage: reviewRuntime.handleSuppressedCodexMessage,
+    handleReviewLifecycleEvent: reviewRuntime.handleCodexLifecycleEvent,
+    showAssistantReplyDetail,
     upsertAssistantReplyCard,
+    linkReplyDetailAlias,
     addPendingReaction,
     movePendingReactionToThread,
     clearPendingReactionForBinding,
